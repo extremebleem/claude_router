@@ -63,4 +63,8 @@ ANTIGRAVITY_HEADERS = {
 }
 
 
-DEFAULT_FALLBACK_PROJECT_ID = "rising-fact-p41fc"
+DEFAULT_FALLBACK_PROJECT_ID = os.environ.get("PROXY_FALLBACK_PROJECT_ID", "rising-fact-p41fc")
+
+# Debug and Logging
+SAVE_DETAILED_REQUEST_LOGS = os.environ.get("PROXY_DEBUG_LOGS", "0").lower() in ("1", "true")
+

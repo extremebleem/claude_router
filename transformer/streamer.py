@@ -29,6 +29,7 @@ async def parse_google_sse_stream(
     output_tokens = 0
     cache_read_tokens = 0
     stop_reason = "end_turn"
+    grounding_metadata: Optional[Dict[str, Any]] = None
 
     buffer = ""
 
@@ -68,6 +69,8 @@ async def parse_google_sse_stream(
                 continue
 
             first_cand = candidates[0]
+            if "groundingMetadata" in first_cand:
+                grounding_metadata = first_cand["groundingMetadata"]
             finish_reason = first_cand.get("finishReason")
             if finish_reason == "MAX_TOKENS":
                 stop_reason = "max_tokens"
@@ -216,6 +219,44 @@ async def parse_google_sse_stream(
             "delta": {"type": "signature_delta", "signature": current_thinking_signature}
         }
         current_thinking_signature = ""
+
+    # Append grounding sources (if Gemini used native Google Search)
+    if grounding_metadata:
+        grounding_chunks = grounding_metadata.get("groundingChunks", [])
+        sources = []
+        for chunk in grounding_chunks:
+            web_info = chunk.get("web", {})
+            uri = web_info.get("uri")
+            title = web_info.get("title") or uri
+            if uri and uri not in [s[1] for s in sources]:
+                sources.append((title, uri))
+        if sources:
+            source_lines = ["\n\n**Sources:**"]
+            for title, uri in sources:
+                source_lines.append(f"- [{title}]({uri})")
+            grounding_text = "\n".join(source_lines)
+
+            if current_block_type == "text":
+                yield {
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {"type": "text_delta", "text": grounding_text}
+                }
+            else:
+                if current_block_type is not None:
+                    yield {"type": "content_block_stop", "index": block_index}
+                    block_index += 1
+                current_block_type = "text"
+                yield {
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": {"type": "text", "text": ""}
+                }
+                yield {
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {"type": "text_delta", "text": grounding_text}
+                }
 
     if current_block_type is not None:
         yield {"type": "content_block_stop", "index": block_index}

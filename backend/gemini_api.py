@@ -36,10 +36,15 @@ class GeminiApiClient:
         # Direct Gemini API expects just the request contents/generationConfig, not the Antigravity wrapper
         google_body = payload_wrapper.get("request", {})
 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:streamGenerateContent?alt=sse&key={self.api_key}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:streamGenerateContent?alt=sse"
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": self.api_key,
+        }
 
         resp = await session.post(
             url,
+            headers=headers,
             json=google_body,
             timeout=aiohttp.ClientTimeout(total=180, sock_read=90)
         )

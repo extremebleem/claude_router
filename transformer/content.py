@@ -13,6 +13,7 @@ from typing import Dict, Any, List, Optional, Tuple, Union
 from transformer.schema import sanitize_schema
 from transformer.signatures import signature_cache, tool_name_cache, SKIP_SIGNATURE_SENTINEL
 from transformer.prompts import build_system_instruction, ANTIGRAVITY_BASE_PROMPT
+from transformer.search import enrich_empty_search_result
 
 ANTIGRAVITY_SYSTEM_INSTRUCTION = (
     "You are Antigravity, a powerful agentic AI coding assistant designed by "
@@ -237,11 +238,15 @@ def convert_anthropic_to_google(
                                             "data": src.get("data", "")
                                         }
                                     })
-                        res_obj = {"output": "\n".join(text_items)}
+                        raw_output = "\n".join(text_items)
+                        enriched_output = enrich_empty_search_result(tool_name, raw_output)
+                        res_obj = {"output": enriched_output}
                     elif isinstance(raw_res, dict):
                         res_obj = raw_res
                     else:
-                        res_obj = {"output": str(raw_res)}
+                        raw_output = str(raw_res)
+                        enriched_output = enrich_empty_search_result(tool_name, raw_output)
+                        res_obj = {"output": enriched_output}
 
                     parts.append({
                         "functionResponse": {
@@ -321,11 +326,33 @@ def convert_anthropic_to_google(
 
     # Prepare tools
     google_tools = []
+    has_native_google_search = bool(anthropic_req.get("enable_google_search"))
+
     if tools and isinstance(tools, list):
         func_decls = []
         for t in tools:
             if not isinstance(t, dict):
                 continue
+
+            # Detect Anthropic native web search tool (e.g. type: "web_search_20250101")
+            t_type = t.get("type", "")
+            if "web_search" in str(t_type).lower():
+                name = t.get("name") or "WebSearch"
+                desc = t.get("description") or "Search the web for current information and external sources."
+                schema = t.get("input_schema") or {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "The search query to look up"}
+                    },
+                    "required": ["query"]
+                }
+                func_decls.append({
+                    "name": name,
+                    "description": desc,
+                    "parameters": sanitize_schema(schema)
+                })
+                continue
+
             name = t.get("name")
             desc = t.get("description", "")
             schema = t.get("input_schema", {})
@@ -337,6 +364,9 @@ def convert_anthropic_to_google(
                 })
         if func_decls:
             google_tools.append({"functionDeclarations": func_decls})
+
+    if has_native_google_search:
+        google_tools.append({"googleSearch": {}})
 
     google_request: Dict[str, Any] = {
         "contents": google_contents,

@@ -80,7 +80,13 @@ class TestServerEndpoints(AioHTTPTestCase):
 
     @unittest_run_loop
     async def test_clear_signature_cache(self):
-        resp = await self.client.post("/test/clear-signature-cache")
+        # Without auth token -> 401
+        resp_unauth = await self.client.post("/test/clear-signature-cache")
+        self.assertEqual(resp_unauth.status, 401)
+
+        # With valid auth token -> 200
+        headers = {"Authorization": "Bearer secret_sandbox_token"}
+        resp = await self.client.post("/test/clear-signature-cache", headers=headers)
         self.assertEqual(resp.status, 200)
         data = await resp.json()
         self.assertTrue(data["success"])
@@ -105,19 +111,25 @@ class TestServerEndpoints(AioHTTPTestCase):
 
     @unittest_run_loop
     async def test_accounts_endpoints(self):
-        # 1. Test GET /accounts
+        # 1. Test GET /accounts (public)
         resp = await self.client.get("/accounts")
         self.assertEqual(resp.status, 200)
         data = await resp.json()
         self.assertIn("accounts", data)
         self.assertIn("total", data)
 
-        # 2. Test POST /accounts/switch with invalid email
-        resp_err = await self.client.post("/accounts/switch", json={"email": "nonexistent@example.com"})
+        # 2. Test POST /accounts/switch without auth token -> 401
+        resp_unauth = await self.client.post("/accounts/switch", json={"email": "nonexistent@example.com"})
+        self.assertEqual(resp_unauth.status, 401)
+
+        headers = {"Authorization": "Bearer secret_sandbox_token"}
+
+        # 3. Test POST /accounts/switch with invalid email and auth -> 404
+        resp_err = await self.client.post("/accounts/switch", json={"email": "nonexistent@example.com"}, headers=headers)
         self.assertEqual(resp_err.status, 404)
 
-        # 3. Test POST /accounts/switch without email
-        resp_bad = await self.client.post("/accounts/switch", json={})
+        # 4. Test POST /accounts/switch without email -> 400
+        resp_bad = await self.client.post("/accounts/switch", json={}, headers=headers)
         self.assertEqual(resp_bad.status, 400)
 
     @unittest_run_loop
@@ -143,10 +155,53 @@ class TestServerEndpoints(AioHTTPTestCase):
 
     @unittest_run_loop
     async def test_refresh_token(self):
-        resp = await self.client.post("/refresh-token")
+        # Without auth -> 401
+        resp_unauth = await self.client.post("/refresh-token")
+        self.assertEqual(resp_unauth.status, 401)
+
+        # With auth -> 200 or 400
+        headers = {"Authorization": "Bearer secret_sandbox_token"}
+        resp = await self.client.post("/refresh-token", headers=headers)
         self.assertIn(resp.status, [200, 400])
         data = await resp.json()
         self.assertIn("status", data)
+
+    @unittest_run_loop
+    async def test_csrf_protection(self):
+        # Cross-site browser requests are rejected with 403
+        headers = {"Sec-Fetch-Site": "cross-site"}
+        resp = await self.client.get("/health", headers=headers)
+        self.assertEqual(resp.status, 403)
+
+        # External origins rejected with 403
+        headers_ext = {"Origin": "https://malicious-website.com"}
+        resp_ext = await self.client.get("/health", headers=headers_ext)
+        self.assertEqual(resp_ext.status, 403)
+
+    @unittest_run_loop
+    async def test_classifier_dangerous_command_guardrail(self):
+        headers = {"Authorization": "Bearer secret_sandbox_token"}
+
+        # 1. Safe command in classifier request -> approved (<block>no</block>)
+        safe_body = {
+            "querySource": "auto_mode",
+            "messages": [{"role": "user", "content": "Execute git status in working directory"}]
+        }
+        resp_safe = await self.client.post("/v1/messages", json=safe_body, headers=headers)
+        self.assertEqual(resp_safe.status, 200)
+        data_safe = await resp_safe.json()
+        self.assertIn("<block>no</block>", data_safe["content"][0]["text"])
+
+        # 2. Destructive command in classifier request -> blocked (<block>yes</block>)
+        danger_body = {
+            "querySource": "auto_mode",
+            "messages": [{"role": "user", "content": "Execute rm -rf / to wipe files"}]
+        }
+        resp_danger = await self.client.post("/v1/messages", json=danger_body, headers=headers)
+        self.assertEqual(resp_danger.status, 200)
+        data_danger = await resp_danger.json()
+        self.assertIn("<block>yes</block>", data_danger["content"][0]["text"])
+        self.assertIn("Blocked dangerous system command", data_danger["content"][0]["text"])
 
 
 if __name__ == "__main__":

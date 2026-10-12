@@ -157,6 +157,18 @@ def run_session(exe_path: str, model_override: Optional[str], sandbox_dir: Optio
             "label": "Gemini 2.5 Flash",
             "description": "Google Gemini 2.5 Flash",
             "behavesAs": "haiku"
+        },
+        {
+            "model": "muse-spark-1.3",
+            "label": "Muse Spark 1.3",
+            "description": "Meta Muse Spark 1.3 Multimodal Agent",
+            "behavesAs": "sonnet"
+        },
+        {
+            "model": "gemini-3.8-search",
+            "label": "Gemini 3.8 Flash (Search Grounding)",
+            "description": "Google Gemini 3.8 Flash with Google Search Grounding",
+            "behavesAs": "sonnet"
         }
     ]
 

@@ -342,6 +342,23 @@ class TestStreamer(unittest.IsolatedAsyncioTestCase):
         texts = [b["text"] for b in agg["content"] if b.get("type") == "text"]
         self.assertEqual("".join(texts), "Hello, world!")
 
+    async def test_grounding_metadata_sources(self):
+        # Fake Google SSE chunks with grounding metadata
+        mock_chunks = [
+            b'data: {"response": {"candidates": [{"content": {"parts": [{"text": "Found recent news."}]}, "groundingMetadata": {"groundingChunks": [{"web": {"uri": "https://example.com/news", "title": "Example News"}}]}}]}}\n\n',
+        ]
+
+        async def _mock_stream():
+            for c in mock_chunks:
+                yield c
+
+        agg = await aggregate_sse_stream_to_json(_mock_stream(), "gemini-3.8-search")
+        texts = [b["text"] for b in agg["content"] if b.get("type") == "text"]
+        full_text = "".join(texts)
+        self.assertIn("Found recent news.", full_text)
+        self.assertIn("https://example.com/news", full_text)
+        self.assertIn("Example News", full_text)
+
 
 class TestClassifierStub(unittest.TestCase):
     def test_classifier_detection(self):
@@ -439,6 +456,48 @@ class TestClassifierStub(unittest.TestCase):
         # Session ID must be completely identical across turns to guarantee Cloud Code prefix cache hits
         self.assertEqual(s1, s2)
         self.assertTrue(s1.startswith("session-"))
+
+    def test_web_search_handling(self):
+        # 1. Anthropic native web search tool (type: "web_search_20250101")
+        req_anthropic_search = {
+            "model": "gemini-3.8-flash-tiered",
+            "messages": [{"role": "user", "content": "Search for news"}],
+            "tools": [
+                {"type": "web_search_20250101", "name": "web_search"}
+            ]
+        }
+        res = convert_anthropic_to_google(req_anthropic_search, "proj-123")
+        tools = res["request"].get("tools", [])
+        self.assertEqual(len(tools), 1)
+        self.assertIn("functionDeclarations", tools[0])
+        self.assertEqual(tools[0]["functionDeclarations"][0]["name"], "web_search")
+
+        # 2. Standalone Google Search grounding flag
+        req_google_search = {
+            "model": "gemini-3.8-flash-tiered",
+            "enable_google_search": True,
+            "messages": [{"role": "user", "content": "Search online"}],
+            "tools": [{"name": "Bash", "input_schema": {"type": "object"}}]
+        }
+        res_gs = convert_anthropic_to_google(req_google_search, "proj-123")
+        gs_tools = res_gs["request"].get("tools", [])
+        self.assertEqual(len(gs_tools), 2)
+        self.assertIn("functionDeclarations", gs_tools[0])
+        self.assertIn("googleSearch", gs_tools[1])
+
+        # 3. WebSearch tool result enricher on empty search output
+        from transformer.search import enrich_empty_search_result
+        empty_search_out = 'Web search results for query: "python"\n\n\nREMINDER: You MUST include the sources above in your response to the user using markdown hyperlinks.'
+        enriched = enrich_empty_search_result("WebSearch", empty_search_out)
+        self.assertIn("python", enriched.lower())
+        self.assertIn("http", enriched)
+
+    def test_muse_spark_prompt_directives(self):
+        from transformer.prompts import build_system_instruction
+        parts = build_system_instruction("muse-spark-1.3", user_system="Work on code.")
+        combined_text = " ".join(p["text"] for p in parts)
+        self.assertIn("Muse Spark", combined_text)
+        self.assertIn("Operating Guidelines", combined_text)
 
 
 if __name__ == "__main__":

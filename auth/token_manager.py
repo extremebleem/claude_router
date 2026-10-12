@@ -40,6 +40,10 @@ class TokenManager:
     def _save(self):
         with open(self.storage_path, "w", encoding="utf-8") as f:
             json.dump(self._data, f, indent=2, ensure_ascii=False)
+        try:
+            self.storage_path.chmod(0o600)
+        except Exception:
+            pass
 
     def set_gemini_api_key(self, api_key: str):
         """Sets a standalone Gemini API key (Google AI Studio)."""

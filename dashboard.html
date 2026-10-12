@@ -544,6 +544,16 @@
             }
         }
 
+        function escapeHtml(str) {
+            if (str === null || str === undefined) return '';
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
         function renderAccounts(accounts) {
             const container = document.getElementById('accounts-container');
             if (!accounts.length) {
@@ -555,22 +565,25 @@
                 const isActive = acc.is_active;
                 const cooldowns = Object.entries(acc.cooldowns || {});
                 const hasCooldown = cooldowns.length > 0;
+                const safeEmail = escapeHtml(acc.email);
+                const safeTier = escapeHtml(acc.tier);
+                const safeProj = acc.project_id ? 'GCP: ' + escapeHtml(acc.project_id) : 'Локальная сессия';
 
                 return `
                     <div class="account-card ${isActive ? 'active' : ''}">
                         <div class="account-header">
                             <div>
-                                <div class="account-email">${acc.email}</div>
+                                <div class="account-email">${safeEmail}</div>
                                 <div style="font-size: 0.75rem; color: var(--text-dim); margin-top: 2px;">
-                                    ${acc.project_id ? 'GCP: ' + acc.project_id : 'Локальная сессия'}
+                                    ${safeProj}
                                 </div>
                             </div>
-                            <span class="account-tier">${acc.tier}</span>
+                            <span class="account-tier">${safeTier}</span>
                         </div>
 
                         ${hasCooldown ? `
                             <div class="account-cooldown">
-                                ⚠️ 429 Кулдаун: ${cooldowns.map(([m, s]) => `${m} (${Math.round(s)}с)`).join(', ')}
+                                ⚠️ 429 Кулдаун: ${cooldowns.map(([m, s]) => `${escapeHtml(m)} (${Math.round(s)}с)`).join(', ')}
                             </div>
                         ` : ''}
 
@@ -579,7 +592,7 @@
                                 ${isActive ? '● АКТИВЕН' : 'Готов к работе'}
                             </span>
                             ${!isActive ? `
-                                <button class="btn" style="padding: 0.35rem 0.75rem; font-size: 0.8rem;" onclick="switchAccount('${acc.email}')">
+                                <button class="btn btn-switch" style="padding: 0.35rem 0.75rem; font-size: 0.8rem;" data-email="${safeEmail}">
                                     Активировать
                                 </button>
                             ` : ''}
@@ -587,19 +600,31 @@
                     </div>
                 `;
             }).join('');
+
+            container.onclick = (e) => {
+                const btn = e.target.closest('.btn-switch');
+                if (btn && btn.dataset.email) {
+                    switchAccount(btn.dataset.email);
+                }
+            };
         }
 
         async function switchAccount(email) {
             try {
+                const headers = { 'Content-Type': 'application/json' };
+                if (window.__PROXY_SESSION_TOKEN) {
+                    headers['Authorization'] = 'Bearer ' + window.__PROXY_SESSION_TOKEN;
+                }
                 const res = await fetch('/accounts/switch', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: headers,
                     body: JSON.stringify({ email })
                 });
                 if (res.ok) {
                     await fetchData();
                 } else {
-                    alert('Ошибка переключения аккаунта');
+                    const err = await res.json().catch(() => ({}));
+                    alert('Ошибка переключения аккаунта: ' + (err.message || res.statusText));
                 }
             } catch (e) {
                 console.error(e);
@@ -614,7 +639,7 @@
                 return;
             }
 
-            document.getElementById('quotas-timestamp').textContent = `Обновлено: ${data.timestamp || 'только что'}`;
+            document.getElementById('quotas-timestamp').textContent = `Обновлено: ${escapeHtml(data.timestamp || 'только что')}`;
 
             // Find active account or first
             const activeAcc = accounts[0];
@@ -627,9 +652,11 @@
             }
 
             container.innerHTML = keys.map(model => {
-                const q = limits[model];
+                const q = limits[model] || {};
                 const fraction = q.remainingFraction != null ? q.remainingFraction : 1.0;
                 const percent = Math.round(fraction * 100);
+                const safeModel = escapeHtml(model);
+                const safeReset = q.resetTime ? escapeHtml(q.resetTime.substring(11, 19) + ' UTC') : '-';
 
                 let color = 'var(--accent-green)';
                 if (percent < 30) color = 'var(--accent-red)';
@@ -638,7 +665,7 @@
                 return `
                     <div class="quota-card">
                         <div class="quota-header">
-                            <span class="quota-model-name">${model}</span>
+                            <span class="quota-model-name">${safeModel}</span>
                             <span class="quota-percent" style="color: ${color};">${percent}%</span>
                         </div>
                         <div class="progress-bar-bg">
@@ -646,7 +673,7 @@
                         </div>
                         <div class="quota-footer">
                             <span>Остаток: ${percent}%</span>
-                            <span>Сброс: ${q.resetTime ? q.resetTime.substring(11, 19) + ' UTC' : '-'}</span>
+                            <span>Сброс: ${safeReset}</span>
                         </div>
                     </div>
                 `;
@@ -670,13 +697,13 @@
                 const statusClass = ev.status === 200 ? 'badge-200' : (ev.status === 429 ? 'badge-429' : 'badge-err');
                 return `
                     <tr>
-                        <td style="color: var(--text-muted);">${ev.time}</td>
-                        <td>${ev.req_id}</td>
-                        <td style="color: var(--accent-blue);">${ev.model}</td>
-                        <td>${ev.account}</td>
-                        <td>${ev.stream ? 'SSE Stream' : 'JSON'}</td>
-                        <td><span class="badge-status ${statusClass}">${ev.status}</span></td>
-                        <td>${ev.latency ? ev.latency + 'ms' : '-'}</td>
+                        <td style="color: var(--text-muted);">${escapeHtml(ev.time)}</td>
+                        <td>${escapeHtml(ev.req_id)}</td>
+                        <td style="color: var(--accent-blue);">${escapeHtml(ev.model)}</td>
+                        <td>${escapeHtml(ev.account)}</td>
+                        <td>${escapeHtml(ev.stream ? 'SSE Stream' : 'JSON')}</td>
+                        <td><span class="badge-status ${statusClass}">${escapeHtml(ev.status)}</span></td>
+                        <td>${ev.latency ? escapeHtml(ev.latency) + 'ms' : '-'}</td>
                     </tr>
                 `;
             }).join('');

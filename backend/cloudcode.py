@@ -14,6 +14,8 @@ from typing import AsyncGenerator, Dict, Any, Tuple, Optional, List
 from config import (
     CLOUDCODE_ENDPOINTS,
     ANTIGRAVITY_HEADERS,
+    DEFAULT_FALLBACK_PROJECT_ID,
+    SAVE_DETAILED_REQUEST_LOGS,
 )
 from auth.token_manager import TokenManager
 from transformer.content import convert_anthropic_to_google
@@ -57,13 +59,17 @@ class CloudCodeClient:
         if not access_token:
             return None, 401, f"Не удалось получить токен для {email}"
 
+        effective_project_id = project_id or DEFAULT_FALLBACK_PROJECT_ID
+        if not project_id:
+            log(f"[CloudCode] [{email}] Внимание: GCP project_id не найден, используется fallback '{effective_project_id}'.", level="WARN")
+
         payload = convert_anthropic_to_google(
             anthropic_request,
-            project_id=project_id or "rising-fact-p41fc",
+            project_id=effective_project_id,
             account_email=email
         )
 
-        if req_id:
+        if req_id and SAVE_DETAILED_REQUEST_LOGS:
             try:
                 p_file = LOGS_DIR / f"req_{req_id}_google_payload.json"
                 with open(p_file, "w", encoding="utf-8") as f:
@@ -97,7 +103,7 @@ class CloudCodeClient:
 
                 if resp.status == 200:
                     log(f"[CloudCode] [{email}] ✓ HTTP 200 OK от {endpoint}")
-                    if req_id:
+                    if req_id and SAVE_DETAILED_REQUEST_LOGS:
                         try:
                             with open(LOGS_DIR / f"req_{req_id}_google_success.json", "w", encoding="utf-8") as f:
                                 json.dump({"status": 200, "endpoint": endpoint, "model": model, "account": email, "headers": dict(resp.headers)}, f, indent=2)

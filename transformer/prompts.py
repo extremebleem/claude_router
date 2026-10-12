@@ -23,6 +23,7 @@ CORE_CODING_GUIDELINES = (
     "- Preserve existing code structure, comments, and style unless explicitly asked to refactor.\n"
     "- Be concise, direct, and actionable. Do not output conversational filler or restate the user's request.\n"
     "- When calling tools, ensure all parameters strictly match the declared schema.\n"
+    "- Proactively use search tools (e.g. WebSearch, Glob, Grep) when information or context is missing or external research is needed.\n"
     "- Never output speculative text when you can inspect files or run tests using available tools.\n"
     "- Use markdown code blocks with explicit language identifiers for all code and diffs."
 )
@@ -76,6 +77,15 @@ MODEL_SPECIFIC_TUNING: Dict[str, str] = {
         "- Follow standard declarative formatting.\n"
         "- Ensure strictly compliant JSON arguments for all tool calls."
     ),
+
+    # Muse Spark family (Meta Superintelligence Labs multimodal coding agent)
+    "muse-spark": (
+        "Model Directive [Muse Spark Coding Agent]:\n"
+        "- Operate as Muse Spark, a state-of-the-art multimodal software engineering agent.\n"
+        "- Prioritize precise, high-velocity code modifications and verified repo-level changes.\n"
+        "- Adhere strictly to tool schemas and emit clean, syntactically correct code blocks.\n"
+        "- Execute autonomous problem solving with minimal conversational overhead."
+    ),
 }
 
 # Identities or terms that trigger false 429/blocked responses in Cloud Code
@@ -83,6 +93,7 @@ IDENTITY_SCRUBS = [
     ("Nous Research", "the assistant team"),
     ("Hermes Agent", "the assistant"),
     ("Hermes", "the assistant"),
+    ("Meta Superintelligence Labs", "the assistant team"),
 ]
 
 
@@ -168,7 +179,11 @@ def build_system_instruction(
     elif "gpt" in m:
         parts.append({"text": MODEL_SPECIFIC_TUNING["gpt-oss"]})
 
-    # 7. Default fallback: Flash Agentic
+    # 7. Muse Spark family
+    elif "muse" in m or "spark" in m:
+        parts.append({"text": MODEL_SPECIFIC_TUNING["muse-spark"]})
+
+    # 8. Default fallback: Flash Agentic
     else:
         parts.append({"text": MODEL_SPECIFIC_TUNING["gemini-flash"]})
 

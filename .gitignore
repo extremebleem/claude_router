@@ -19,6 +19,7 @@ accounts.json
 
 # Scratch & Sandbox
 scratch/
+friends_logs/
 .claude-sandbox/
 .claude/
 
