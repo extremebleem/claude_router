@@ -487,10 +487,12 @@ class TestClassifierStub(unittest.TestCase):
 
         # 3. WebSearch tool result enricher on empty search output
         from transformer.search import enrich_empty_search_result
+        from unittest.mock import patch
         empty_search_out = 'Web search results for query: "python"\n\n\nREMINDER: You MUST include the sources above in your response to the user using markdown hyperlinks.'
-        enriched = enrich_empty_search_result("WebSearch", empty_search_out)
-        self.assertIn("python", enriched.lower())
-        self.assertIn("http", enriched)
+        with patch("transformer.search.perform_web_search", return_value=[{"title": "Python Programming", "url": "https://www.python.org", "snippet": "Official site"}]):
+            enriched = enrich_empty_search_result("WebSearch", empty_search_out)
+            self.assertIn("python", enriched.lower())
+            self.assertIn("http", enriched)
 
     def test_muse_spark_prompt_directives(self):
         from transformer.prompts import build_system_instruction
@@ -498,6 +500,72 @@ class TestClassifierStub(unittest.TestCase):
         combined_text = " ".join(p["text"] for p in parts)
         self.assertIn("Muse Spark", combined_text)
         self.assertIn("Operating Guidelines", combined_text)
+
+    def test_state_classifier_stub_detection(self):
+        from server import ProxyApp
+        from auth.token_manager import TokenManager
+        from aiohttp.test_utils import make_mocked_request
+
+        app = ProxyApp(TokenManager())
+        req = make_mocked_request("POST", "/v1/messages")
+
+        # 1. State classifier via querySource
+        body_qs = {"messages": [{"role": "user", "content": "state check"}], "querySource": "auto_mode_state"}
+        self.assertTrue(app.is_state_classifier_request(req, body_qs))
+
+        # 2. State classifier via prompt text
+        body_text = {
+            "messages": [{"role": "user", "content": "test"}],
+            "system": "A user kicked off a Claude Code agent to do a coding task and walked away. Read the tail..."
+        }
+        self.assertTrue(app.is_state_classifier_request(req, body_text))
+
+        # 3. Normal request -> False
+        body_norm = {"messages": [{"role": "user", "content": "write code"}], "system": "You are helpful."}
+        self.assertFalse(app.is_state_classifier_request(req, body_norm))
+
+    def test_system_prompt_sanitization_and_auto_mode(self):
+        from transformer.prompts import extract_user_system_prompt, build_system_instruction
+
+        raw_system = [
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.296.418; cc_entrypoint=cli;"},
+            {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
+            {"type": "text", "text": (
+                "You are an agent working with the user.\n\n"
+                "# Harness\n- Tools run behind permissions.\n\n"
+                "# Environment\n- The most recent Claude models are the Claude 5 family.\n\n"
+                "# Background Session\nThis session runs as a background job."
+            )}
+        ]
+
+        cleaned = extract_user_system_prompt(raw_system)
+
+        # 1. Billing headers must be completely stripped
+        self.assertNotIn("x-anthropic-billing-header", cleaned.lower())
+        self.assertNotIn("cc_version", cleaned.lower())
+
+        # 2. Block 1 identity must be stripped
+        self.assertNotIn("you are claude code", cleaned.lower())
+        self.assertNotIn("anthropic's official cli", cleaned.lower())
+
+        # 3. Harness preserved
+        self.assertIn("# Harness", cleaned)
+
+        # 4. Environment updated (Claude 5 hallucination removed)
+        self.assertNotIn("claude 5", cleaned.lower())
+        self.assertIn("Antigravity", cleaned)
+
+        # 5. Auto mode native tools policy injected
+        self.assertIn("Mandatory Native File Tools", cleaned)
+        self.assertIn("Read", cleaned)
+        self.assertIn("Edit", cleaned)
+        self.assertIn("Write", cleaned)
+
+        # 6. Base prompt uses Antigravity identity
+        parts = build_system_instruction("gemini-3.8-flash-tiered", user_system=raw_system)
+        full_sys = " ".join(p["text"] for p in parts)
+        self.assertIn("Antigravity", full_sys)
+        self.assertNotIn("Claude Code", full_sys)
 
 
 if __name__ == "__main__":

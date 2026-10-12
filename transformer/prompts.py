@@ -5,7 +5,21 @@ while safely integrating user-defined project instructions (CLAUDE.md, git attri
 """
 
 import re
+from pathlib import Path
 from typing import Dict, Any, List, Optional, Union
+
+PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
+
+
+def load_prompt_file(filename: str, fallback: str = "") -> str:
+    """Reads prompt template from prompts/ directory if present."""
+    path = PROMPTS_DIR / filename
+    if path.exists():
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+    return fallback
 
 # Core Antigravity identity required by Google Cloud Code infrastructure
 ANTIGRAVITY_BASE_PROMPT = (
@@ -94,6 +108,9 @@ IDENTITY_SCRUBS = [
     ("Hermes Agent", "the assistant"),
     ("Hermes", "the assistant"),
     ("Meta Superintelligence Labs", "the assistant team"),
+    ("Claude Code", "Antigravity"),
+    ("Anthropic's official CLI for Claude", "Google Antigravity Coding Assistant"),
+    ("Anthropic", "Google DeepMind"),
 ]
 
 
@@ -104,19 +121,28 @@ def sanitize_user_system_text(text: str) -> str:
     cleaned = text
     # Strip Anthropic billing header that triggers Google Cloud Code 429 RESOURCE_EXHAUSTED
     cleaned = re.sub(r"x-anthropic-billing-header[^\n]*\n?", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"cc_version=[^\n;]*;?", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"cc_entrypoint=[^\n;]*;?", "", cleaned, flags=re.IGNORECASE)
     for term, replacement in IDENTITY_SCRUBS:
         cleaned = cleaned.replace(term, replacement)
     return cleaned.strip()
 
 
 def extract_user_system_prompt(raw_system: Optional[Union[str, List[Any]]]) -> str:
-    """Extracts and normalizes client system text from Anthropic string or block list."""
+    """
+    Extracts, sanitizes, and modernizes client system text:
+    - Strips all technical billing headers (x-anthropic-billing-header, cc_version)
+    - Strips Claude Code / Anthropic identity declarations
+    - Updates # Environment section with real Antigravity details
+    - Injects auto mode native tools policy (mandatory Read/Edit/Write tools, no python scripts)
+    """
     if not raw_system:
         return ""
+
+    chunks: List[str] = []
     if isinstance(raw_system, str):
-        return sanitize_user_system_text(raw_system)
+        chunks.append(raw_system)
     elif isinstance(raw_system, list):
-        chunks = []
         for block in raw_system:
             if isinstance(block, str):
                 text = block
@@ -124,13 +150,37 @@ def extract_user_system_prompt(raw_system: Optional[Union[str, List[Any]]]) -> s
                 text = block.get("text", "")
             else:
                 continue
-            # Skip blocks that solely consist of billing headers
-            if "x-anthropic-billing-header" in text.lower():
-                text = re.sub(r"x-anthropic-billing-header[^\n]*\n?", "", text, flags=re.IGNORECASE).strip()
-            if text:
-                chunks.append(text)
-        return sanitize_user_system_text("\n\n".join(chunks))
-    return ""
+
+            text_lower = text.lower()
+            # 1. Skip technical billing info
+            if "x-anthropic-billing-header" in text_lower or "cc_version=" in text_lower or "cc_entrypoint=" in text_lower:
+                continue
+
+            # 2. Skip Block 1: "You are Claude Code, Anthropic's official CLI for Claude"
+            if "you are claude code" in text_lower or "anthropic's official cli" in text_lower:
+                continue
+
+            clean_block = text.strip()
+            if clean_block:
+                chunks.append(clean_block)
+
+    combined = "\n\n".join(chunks)
+
+    # 3. Replace Environment section if present with updated Antigravity environment
+    env_content = load_prompt_file("environment.md")
+    if env_content and "# Environment" in combined:
+        env_pattern = r"# Environment\s*\n.*?(?=\n# |\Z)"
+        combined = re.sub(env_pattern, env_content + "\n", combined, flags=re.DOTALL)
+
+    # 4. In auto mode / background session: inject mandatory native Read/Edit/Write policy
+    auto_mode_content = load_prompt_file("auto_mode.md")
+    if auto_mode_content:
+        if "# Background Session" in combined:
+            combined = combined.replace("# Background Session", f"# Background Session\n\n{auto_mode_content}\n")
+        else:
+            combined = f"{combined}\n\n{auto_mode_content}"
+
+    return sanitize_user_system_text(combined)
 
 
 def build_system_instruction(
@@ -143,9 +193,10 @@ def build_system_instruction(
     and safely integrating the client's custom system prompt (CLAUDE.md, instructions).
     """
     m = model_name.lower()
+    antigravity_identity = load_prompt_file("antigravity_identity.md", fallback=ANTIGRAVITY_BASE_PROMPT)
 
     parts: List[Dict[str, str]] = [
-        {"text": ANTIGRAVITY_BASE_PROMPT},
+        {"text": antigravity_identity},
         {"text": CORE_CODING_GUIDELINES}
     ]
 

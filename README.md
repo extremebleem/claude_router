@@ -112,9 +112,21 @@ python launcher.py --sandbox-dir C:\custom-sandbox
 
 ---
 
+## 📝 Настройка системных промптов (`prompts/`)
+
+Прокси автоматически санирует и трансформирует системные промпты Claude Code, заменяя их нативные инструкции и удаляя технические биллинг-заголовки. Настройки вынесены в файлы Markdown в директории `prompts/`:
+
+* **`prompts/antigravity_identity.md`**: задает нативную идентичность Antigravity (Google DeepMind) вместо упоминаний Claude Code.
+* **`prompts/auto_mode.md`**: правила для авто-режима (обязательное использование нативных инструментов `Read`, `Edit`, `Write` вместо генерации временных Python-скриптов для правок файлов).
+* **`prompts/environment.md`**: актуальное окружение (интеграция с PowerShell/bash, модели Gemini).
+
+Файлы можно редактировать под свои нужды — изменения подхватываются сервером на лету.
+
+---
+
 ## 🧪 Запуск тестов
 
 ```powershell
-python tests/test_transformer.py
-python tests/test_server.py
+python -m unittest discover -s tests
 ```
+

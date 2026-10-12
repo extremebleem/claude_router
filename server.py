@@ -464,6 +464,113 @@ class ProxyApp:
         await response.write_eof()
         return response
 
+    def is_state_classifier_request(self, request: web.Request, body: dict) -> bool:
+        """
+        Detects if request is an auto-mode state / notification classifier check
+        (e.g. deciding between 'done', 'working', 'blocked', 'failed').
+        """
+        if body.get("querySource") in ["auto_mode_state", "auto_mode_notification", "auto_mode_critique", "auto_mode_investigator"]:
+            return True
+
+        text_chunks = []
+        sys_val = body.get("system")
+        if isinstance(sys_val, str):
+            text_chunks.append(sys_val)
+        elif isinstance(sys_val, list):
+            for b in sys_val:
+                if isinstance(b, dict) and "text" in b:
+                    text_chunks.append(b["text"])
+
+        combined = " ".join(text_chunks).lower()
+        if "kicked off a claude code agent" in combined or "decide which of four states it's in" in combined:
+            return True
+
+        return False
+
+    async def handle_state_classifier_stub(self, request: web.Request, raw_model: str, stream: bool, req_id: str):
+        """Returns an immediate 'working' state JSON stub for background state classifier checks."""
+        log(f"[State Classifier Stub] [Req #{req_id}] Запрос анализатора состояния перехвачен -> Автоматический ответ 'working'")
+        stub_data = {
+            "state": "working",
+            "detail": "continuing autonomous work",
+            "tempo": "active",
+            "output": {}
+        }
+        stub_text = json.dumps(stub_data)
+        msg_id = f"msg_state_{secrets.token_hex(12)}"
+
+        if not stream:
+            return web.json_response({
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "model": raw_model,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": stub_text
+                    }
+                ],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {
+                    "input_tokens": 15,
+                    "output_tokens": 10
+                }
+            })
+
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream; charset=utf-8",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive"
+            }
+        )
+        await response.prepare(request)
+        events = [
+            {
+                "type": "message_start",
+                "message": {
+                    "id": msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": raw_model,
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 15, "output_tokens": 1}
+                }
+            },
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            },
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": stub_text}
+            },
+            {
+                "type": "content_block_stop",
+                "index": 0
+            },
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": 10}
+            },
+            {
+                "type": "message_stop"
+            }
+        ]
+        for evt in events:
+            await response.write(f"event: {evt['type']}\ndata: {json.dumps(evt)}\n\n".encode("utf-8"))
+            await response.drain()
+        await response.write_eof()
+        return response
+
     async def get_backend_stream(self, body: dict, req_id: Optional[str] = None):
         """
         Dispatches request to Antigravity Cloud Code with multi-account failover.
@@ -535,7 +642,22 @@ class ProxyApp:
         tools_count = len(body.get("tools", [])) if isinstance(body.get("tools"), list) else 0
         log(f"[Req #{req_id}] Запрос /v1/messages: model={model} (raw={raw_model}), stream={stream}, msgs={len(messages)}, tools={tools_count}")
 
-        # Check for Auto Mode Classifier check -> Return instant approved stub without network routing
+        # 1. Check for Auto Mode State / Notification Classifier check -> Return instant working stub
+        if self.is_state_classifier_request(request, body):
+            self.recent_events.insert(0, {
+                "time": time.strftime("%H:%M:%S"),
+                "req_id": req_id,
+                "model": raw_model,
+                "account": "state-classifier-stub",
+                "stream": stream,
+                "status": 200,
+                "latency": 0
+            })
+            if len(self.recent_events) > 50:
+                self.recent_events.pop()
+            return await self.handle_state_classifier_stub(request, raw_model, stream, req_id)
+
+        # 2. Check for Auto Mode Classifier check -> Return instant approved stub without network routing
         if self.is_classifier_request(request, body):
             dangerous_cmd = self.detect_dangerous_command(body)
             self.recent_events.insert(0, {
