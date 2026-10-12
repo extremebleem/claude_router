@@ -247,6 +247,22 @@ def convert_anthropic_to_google(
     tool_name_map: Dict[str, str] = {}
     tool_args_map: Dict[str, Dict[str, Any]] = {}
 
+    # Pre-scan messages to find the latest Read tool_use_id for each file_path
+    latest_read_ids: Dict[str, str] = {}
+    read_id_to_path: Dict[str, str] = {}
+    for msg in messages:
+        c = msg.get("content")
+        if isinstance(c, list):
+            for block in c:
+                if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == "Read":
+                    t_id = block.get("id")
+                    inp = block.get("input")
+                    if t_id and isinstance(inp, dict) and "file_path" in inp:
+                        fp = inp.get("file_path")
+                        if isinstance(fp, str):
+                            latest_read_ids[fp] = t_id
+                            read_id_to_path[t_id] = fp
+
     # Total messages in request
     total_msgs = len(messages)
     # Active recent window: preserve full output for the most recent 40 messages
@@ -362,7 +378,17 @@ def convert_anthropic_to_google(
                     raw_res = block.get("content", "")
                     extracted_images = []
 
-                    if isinstance(raw_res, list):
+                    # Superseded Read deduplication: if this Read is superseded by a later Read of the same file
+                    is_superseded_read = False
+                    read_path = read_id_to_path.get(tool_id)
+                    if not read_path and tool_name == "Read" and isinstance(tool_input_args, dict):
+                        read_path = tool_input_args.get("file_path")
+                    if read_path and latest_read_ids.get(read_path) != tool_id:
+                        is_superseded_read = True
+
+                    if is_superseded_read:
+                        res_obj = {"output": f"[File content omitted: superseded by a later Read of {read_path}]"}
+                    elif isinstance(raw_res, list):
                         text_items = []
                         for item in raw_res:
                             if not isinstance(item, dict):
