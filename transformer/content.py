@@ -14,6 +14,7 @@ from transformer.schema import sanitize_schema
 from transformer.signatures import signature_cache, tool_name_cache, SKIP_SIGNATURE_SENTINEL
 from transformer.prompts import build_system_instruction, ANTIGRAVITY_BASE_PROMPT
 from transformer.search import enrich_empty_search_result
+from transformer.streamer import estimate_request_tokens
 
 ANTIGRAVITY_SYSTEM_INSTRUCTION = (
     "You are Antigravity, a powerful agentic AI coding assistant designed by "
@@ -77,6 +78,44 @@ def truncate_tool_output(
         )
 
     return output_text
+
+
+def calculate_thinking_budget(
+    model: str,
+    total_prompt_tokens: int,
+    user_budget: Optional[int] = None
+) -> int:
+    """
+    Calculates token-aware dynamic thinking budget based on prompt token count.
+    Scales down for larger context windows to prevent token waste and latency explosion.
+    """
+    m = model.lower()
+    # 1. Base budget
+    if user_budget is not None:
+        budget = user_budget
+    elif "claude" in m:
+        budget = 32000
+    elif "pro" in m:
+        budget = 16000
+    else:
+        budget = 2048
+
+    is_flash = "claude" not in m and "pro" not in m
+
+    # 2. Context scaling
+    if total_prompt_tokens > 300_000:
+        clamp_max = 1024 if is_flash else 4096
+        budget = min(budget, clamp_max)
+    elif total_prompt_tokens > 100_000:
+        clamp_max = 2048 if is_flash else 8192
+        budget = min(budget, clamp_max)
+
+    # 3. Model maximum ceiling
+    max_ceiling = 24576 if "2.5" in m else 64000
+    budget = min(budget, max_ceiling)
+
+    # 4. Minimum floor
+    return max(budget, 1024)
 
 
 def derive_session_id(
@@ -336,33 +375,30 @@ def convert_anthropic_to_google(
 
     # Configure thinking budget if requested or if using a thinking model
     if is_thinking:
+        total_prompt_tokens = estimate_request_tokens(anthropic_req)
+        user_budget = None
+        if isinstance(thinking_param, dict) and "budget_tokens" in thinking_param:
+            user_budget = thinking_param["budget_tokens"]
+
+        scaled_budget = calculate_thinking_budget(model, total_prompt_tokens, user_budget=user_budget)
+
         if "claude" in model.lower():
             # Claude Cloud Code thinking format (snake_case)
-            budget = 32000
-            if isinstance(thinking_param, dict) and "budget_tokens" in thinking_param:
-                budget = thinking_param["budget_tokens"]
             gen_config["thinkingConfig"] = {
                 "include_thoughts": True,
-                "thinking_budget": budget
+                "thinking_budget": scaled_budget
             }
             # Claude requires maxOutputTokens > thinking_budget
-            gen_config["maxOutputTokens"] = max(gen_config.get("maxOutputTokens", 16384), budget + 8192)
+            gen_config["maxOutputTokens"] = max(gen_config.get("maxOutputTokens", 16384), scaled_budget + 8192)
             if tools:
                 system_parts.append({
                     "text": "Interleaved thinking is enabled. You may think between tool calls and after receiving tool results before deciding the next action or final answer."
                 })
         else:
             # Gemini thinking format (camelCase)
-            budget = 2048
-            if isinstance(thinking_param, dict) and "budget_tokens" in thinking_param:
-                budget = thinking_param["budget_tokens"]
-            elif "high" in model.lower() or "pro" in model.lower():
-                budget = 16000
-            # Clamp budget for Gemini versions (e.g. 2.5 Flash max is 24576)
-            max_budget = 24576 if "2.5" in model else 64000
             gen_config["thinkingConfig"] = {
                 "includeThoughts": True,
-                "thinkingBudget": min(budget, max_budget)
+                "thinkingBudget": scaled_budget
             }
 
     # Prepare tools
