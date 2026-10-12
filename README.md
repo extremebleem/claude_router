@@ -1,132 +1,131 @@
 # Claude-Gemini Proxy & Claude Code Sandbox Launcher
 
-Высокопроизводительный асинхронный прокси-сервер на **Python (`aiohttp`)**, транслирующий запросы из **Claude Code** в облачный бэкенд **Google Antigravity Cloud Code** и **Google AI Studio (Gemini)**.
+A high-performance asynchronous proxy server built with **Python (`aiohttp`)** that bridges requests from **Claude Code** to the **Google Antigravity Cloud Code** and **Google AI Studio (Gemini)** backends.
 
-Обеспечивает запуск **Claude Code CLI** в полностью изолированной песочнице, а также предоставляет API-эндпоинт для сторонних GUI-клиентов (Chatbox, LibreChat, Cline).
-
----
-
-## 🌟 Ключевые возможности
-
-1. **Изолированный лаунчер для Claude Code CLI**:
-   * Автоматически находит исполняемый файл `claude.exe` (в `~/.local/bin` или через `PATH`).
-   * Запускает CLI в отдельном окружении без конфликтов с другими сессиями.
-
-2. **Полная изоляция (Sandbox)**:
-   * Каждая сессия получает динамический эфемерный порт (`127.0.0.1:<PORT>`).
-   * Генерируется уникальный криптографический `session_token` для защиты от посторонних подключений.
-   * Изолированная директория конфигурации `~/.claude-sandbox` (`CLAUDE_CONFIG_DIR`).
-   * **Вторая сессия** в обычном терминале с официальным аккаунтом Anthropic работает параллельно без каких-либо пересечений.
-
-3. **Совместимость с Anthropic Messages API**:
-   * Стриминг Server-Sent Events (SSE) в реальном времени.
-   * Поддержка авто-режима (Auto Mode) со встроенным 0ms классификатором (`is_classifier_request`).
-   * Конвертация вызова функций (`tools` ➔ Protobuf Schema в верхнем регистре).
-   * Поддержка рассуждений (**Thinking**) и кэширование сигнатур `thoughtSignature`.
-   * Автоматическая маскировка заголовков и очистка полей `cache_control`.
-
-4. **Гибкая авторизация**:
-   * Google OAuth 2.0 (клиент Antigravity) со встроенным callback-сервером.
-   * Автоматический рефреш токенов через `refresh_token`.
-   * Возможность использования прямого API-ключа Gemini (`AIzaSy...`).
+Enables running the **Claude Code CLI** in a fully isolated sandbox, while also providing an Anthropic-compatible API endpoint for third-party GUI clients (Chatbox, LibreChat, Cline).
 
 ---
 
-## 🚀 Быстрый старт
+## 🌟 Key Features
 
-### 1. Авторизация (выполняется один раз)
+1. **Isolated Launcher for Claude Code CLI**:
+   * Automatically discovers the `claude.exe` executable (in `~/.local/bin` or via `PATH`).
+   * Launches the CLI in an isolated environment without interfering with other sessions.
+
+2. **Full Sandbox Isolation**:
+   * Every session gets a dynamic ephemeral port (`127.0.0.1:<PORT>`).
+   * Generates a unique cryptographic `session_token` to prevent unauthorized local connections.
+   * Isolated configuration directory at `~/.claude-sandbox` (`CLAUDE_CONFIG_DIR`).
+   * Run a **second session** simultaneously in a regular terminal with your official Anthropic account without any conflicts or state leaks.
+
+3. **Anthropic Messages API Compatibility**:
+   * Real-time Server-Sent Events (SSE) streaming.
+   * Auto Mode support with a built-in instant local classifier stub (`is_classifier_request`).
+   * Function calling conversion (`tools` ➔ Protobuf Schema in UPPERCASE).
+   * Extended thinking support with `thoughtSignature` caching.
+   * Automatic header masking and `cache_control` cleanup.
+
+4. **Flexible Authentication**:
+   * Google OAuth 2.0 (Antigravity client) with a built-in local callback server.
+   * Automatic token refreshing via `refresh_token`.
+   * Support for direct Gemini API keys (`AIzaSy...`).
+
+---
+
+## 🚀 Quick Start
+
+### 1. Authentication (one-time setup)
 
 ```powershell
 cd C:\AI\ClaudeGemini
 
-# Войти через Google в браузере
+# Sign in via Google in your browser
 python cli_auth.py login
 
-# Проверить статус и привязанный GCP-проект
+# Check status and linked GCP project
 python cli_auth.py status
 
-# Посмотреть доступные квоты моделей Cloud Code
+# View available Cloud Code model quotas
 python cli_auth.py quotas
 ```
 
-*(Опционально)* Если хотите использовать прямой ключ Gemini API:
+*(Optional)* If you prefer using a direct Gemini API key:
 ```powershell
 python cli_auth.py set-key AIzaSy...
 ```
 
 ---
 
-### 2. Запуск Claude Code CLI в песочнице
+### 2. Launching Claude Code CLI in Sandbox
 
 ```powershell
-# Запуск Claude Code CLI (модель по умолчанию: gemini-3.8-flash-tiered):
+# Launch Claude Code CLI (default model: gemini-3.8-flash-tiered):
 python launcher.py
 
-# С выбором конкретной модели:
+# Launch with a specific model:
 python launcher.py --model gemini-3.1-pro-high
 
-# С открытием веб-дашборда метрик и переключения моделей:
+# Launch with the web dashboard for metrics and model switching:
 python launcher.py --dashboard
 ```
 
 ---
 
-### 3. Использование с GUI-клиентами (Chatbox, LibreChat, Cline)
+### 3. Using with GUI Clients (Chatbox, LibreChat, Cline)
 
-Официальный Claude Desktop не поддерживает сторонние эндпоинты (он жестко привязан к `claude.ai`). Но вы можете запустить автономный прокси для любого совместимого GUI:
+Official Claude Desktop does not support third-party endpoints (it is hard-coded to `claude.ai`). However, you can run a standalone proxy for any compatible GUI client:
 
 ```powershell
 python launcher.py proxy
 ```
-* **Адрес прокси (Base URL)**: `http://127.0.0.1:8080`
-* **API Key**: любой произвольный текст (например, `sk-ant-test`)
-* В клиенте (например, **Chatbox** или **Cline**) выберите формат **Anthropic** и укажите адрес выше.
+* **Base URL**: `http://127.0.0.1:8080`
+* **API Key**: any non-empty string (e.g. `sk-ant-test`)
+* In your client (e.g., **Chatbox** or **Cline**), select the **Anthropic** provider and specify the Base URL above.
 
 ---
 
-## ⚙️ Дополнительные параметры
+## ⚙️ Additional Options
 
 ```powershell
-# Подробный вывод всех запросов прокси в консоль:
+# Verbose logging of all proxy requests to console:
 python launcher.py -v
 
-# Указать кастомную папку конфигурации:
+# Custom sandbox configuration directory:
 python launcher.py --sandbox-dir C:\custom-sandbox
 ```
 
 ---
 
-## 🔍 Поддержка Web Search и Моделей Muse Spark
+## 🔍 Web Search & Muse Spark Model Support
 
-1. **Клиентский Web Search (Anthropic Tools)**:
-   * Прокси полностью поддерживает клиентские инструменты поиска (`WebSearch`, нативные блоки Anthropic `type: "web_search_20250101"`).
-   * **Автоматическое обогащение (Fallback Enricher)**: если клиентский инструмент WebSearch возвращает пустой список результатов (из-за недоступности upstream-сервиса поиска), прокси автоматически перехватывает пустой ответ и подставляет реальные сниппеты и ссы��ки через встроенный движок поиска (`transformer/search.py`).
+1. **Client-Side Web Search (Anthropic Tools)**:
+   * Full support for client search tools (`WebSearch`, native Anthropic `type: "web_search_20250101"` blocks).
+   * **Automatic Fallback Enricher**: If the client's WebSearch tool returns an empty result set (due to upstream search provider downtime), the proxy automatically intercepts the empty response and enriches it with real search snippets and URLs via the built-in search engine (`transformer/search.py`).
 
-2. **Встроенный Google Search Grounding**:
-   * Для использования нативного поиска Google от Gemini можно выбрать модель `gemini-3.8-search` (или добавить флаг `"google_search": true` / `"web_search": true` в тело запроса).
-   * Источники поиска автоматически форматируются и добавляются в ответ в секции `**Sources:** [Title](URL)`.
+2. **Built-in Google Search Grounding**:
+   * For native Gemini Google Search, select `gemini-3.8-search` (or pass `"google_search": true` / `"web_search": true` in the request body).
+   * Search sources are automatically formatted and appended to responses under `**Sources:** [Title](URL)`.
 
-3. **Поддержка Meta Muse Spark (`muse-spark-1.3`, `muse-spark`)**:
-   * Включены биндинги и пресеты для расширения **`muse-spark-code`** (VS Code / ACP / Model API).
-   * Модели `muse-spark-1.3`, `muse-spark`, `muse-code` доступны в селекторе моделей и автоматически транслируются в производительный бэкенд с поддержкой рассуждений и работы с кодом.
-
----
-
-## 📝 Настройка системных промптов (`prompts/`)
-
-Прокси автоматически санирует и трансформирует системные промпты Claude Code, заменяя их нативные инструкции и удаляя технические биллинг-заголовки. Настройки вынесены в файлы Markdown в директории `prompts/`:
-
-* **`prompts/antigravity_identity.md`**: задает нативную идентичность Antigravity (Google DeepMind) вместо упоминаний Claude Code.
-* **`prompts/auto_mode.md`**: правила для авто-режима (обязательное использование нативных инструментов `Read`, `Edit`, `Write` вместо генерации временных Python-скриптов для правок файлов).
-* **`prompts/environment.md`**: актуальное окружение (интеграция с PowerShell/bash, модели Gemini).
-
-Файлы можно редактировать под свои нужды — изменения подхватываются сервером на лету.
+3. **Meta Muse Spark Support (`muse-spark-1.3`, `muse-spark`)**:
+   * Built-in bindings and presets for the **`muse-spark-code`** extension (VS Code / ACP / Model API).
+   * Models `muse-spark-1.3`, `muse-spark`, and `muse-code` are available in the model selector and mapped to a high-performance backend with coding and reasoning capabilities.
 
 ---
 
-## 🧪 Запуск тестов
+## 📝 Custom System Prompts (`prompts/`)
+
+The proxy automatically sanitizes and transforms Claude Code system prompts, replacing upstream default instructions and stripping technical billing headers. Custom prompt templates are stored as Markdown files in the `prompts/` directory:
+
+* **`prompts/antigravity_identity.md`**: Sets the Antigravity identity (Google DeepMind) in place of Claude Code mentions.
+* **`prompts/auto_mode.md`**: Autonomous mode rules (enforcing native `Read`, `Edit`, `Write` tools over ad-hoc Python file manipulation scripts).
+* **`prompts/environment.md`**: Actual environment description (PowerShell/bash integration, Gemini models).
+
+These files can be freely customized to fit your workflow — changes are reloaded on the fly.
+
+---
+
+## 🧪 Running Tests
 
 ```powershell
 python -m unittest discover -s tests
 ```
-
