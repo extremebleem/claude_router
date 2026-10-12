@@ -259,7 +259,7 @@ def run_session(exe_path: str, model_override: Optional[str], sandbox_dir: Optio
             "ANTHROPIC_MODEL": active_model,
             "ANTHROPIC_DEFAULT_MODEL": active_model,
             "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT": "1",
-            "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000",
+            "CLAUDE_CODE_MAX_CONTEXT_TOKENS": os.environ.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "200000"),
             "CLAUDE_CODE_AUTO_MODE_SERVER": "0"
         }
     }
@@ -313,7 +313,7 @@ def run_session(exe_path: str, model_override: Optional[str], sandbox_dir: Optio
     proc_env["CLAUDE_CODE_AUTO_MODE_SERVER"] = "0"
 
     proc_env["CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT"] = "1"
-    proc_env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = "1000000"
+    proc_env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = os.environ.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "200000")
     proc_env["CLAUDE_CONFIG_DIR"] = str(sandbox_path)
 
     cmd = [exe_path]
