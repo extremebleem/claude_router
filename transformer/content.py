@@ -288,7 +288,11 @@ def convert_anthropic_to_google(
                 # 3. Image block (base64 or URL)
                 elif b_type == "image":
                     src = block.get("source", {})
-                    if src.get("type") == "base64":
+                    if is_historic_turn:
+                        # Collapse bulky base64 image data from old turns to keep KV-cache compact
+                        mime = src.get("media_type", "image/png")
+                        parts.append({"text": f"[Image attachment from prior turn: {mime}]"})
+                    elif src.get("type") == "base64":
                         parts.append({
                             "inlineData": {
                                 "mimeType": src.get("media_type", "image/png"),
@@ -306,7 +310,11 @@ def convert_anthropic_to_google(
                 # 4. Document block (e.g. PDF base64 or URL)
                 elif b_type == "document":
                     src = block.get("source", {})
-                    if src.get("type") == "base64":
+                    if is_historic_turn:
+                        # Collapse bulky document data from old turns
+                        mime = src.get("media_type", "application/pdf")
+                        parts.append({"text": f"[Document attachment from prior turn: {mime}]"})
+                    elif src.get("type") == "base64":
                         parts.append({
                             "inlineData": {
                                 "mimeType": src.get("media_type", "application/pdf"),
@@ -363,7 +371,10 @@ def convert_anthropic_to_google(
                                 text_items.append(item.get("text", ""))
                             elif item.get("type") == "image":
                                 src = item.get("source", {})
-                                if src.get("type") == "base64":
+                                if is_historic_turn:
+                                    mime = src.get("media_type", "image/png")
+                                    text_items.append(f"[Image attachment from prior turn: {mime}]")
+                                elif src.get("type") == "base64":
                                     extracted_images.append({
                                         "inlineData": {
                                             "mimeType": src.get("media_type", "image/png"),
@@ -450,10 +461,6 @@ def convert_anthropic_to_google(
             }
             # Claude requires maxOutputTokens > thinking_budget
             gen_config["maxOutputTokens"] = max(gen_config.get("maxOutputTokens", 16384), scaled_budget + 8192)
-            if tools:
-                system_parts.append({
-                    "text": "Interleaved thinking is enabled. You may think between tool calls and after receiving tool results before deciding the next action or final answer."
-                })
         else:
             # Gemini thinking format (camelCase)
             gen_config["thinkingConfig"] = {

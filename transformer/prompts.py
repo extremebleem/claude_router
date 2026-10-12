@@ -209,6 +209,9 @@ def build_system_instruction(
         parts.append({"text": MODEL_SPECIFIC_TUNING["thinking"]})
         if "claude" in m:
             parts.append({"text": MODEL_SPECIFIC_TUNING["claude"]})
+            parts.append({
+                "text": "Interleaved thinking is enabled. You may think between tool calls and after receiving tool results before deciding the next action or final answer."
+            })
         elif "muse" in m or "spark" in m:
             parts.append({"text": MODEL_SPECIFIC_TUNING["muse-spark"]})
         elif "pro" in m:

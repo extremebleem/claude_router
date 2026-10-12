@@ -131,6 +131,33 @@ class TestToolOutputTruncation(unittest.TestCase):
         self.assertNotIn("Prior tool output collapsed", last_resp)
         self.assertIn("log entry 49", last_resp)
 
+    def test_historic_media_collapsing(self):
+        # Build 50 messages with an image in turn 0 (historic) and turn 48 (recent)
+        msgs = []
+        for i in range(50):
+            content = []
+            if i == 0 or i == 48:
+                content.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="}
+                })
+            content.append({"type": "text", "text": f"message {i}"})
+            msgs.append({"role": "user" if i % 2 == 0 else "assistant", "content": content})
+
+        req = {"model": "gemini-3.8-flash-tiered", "messages": msgs}
+        res = convert_anthropic_to_google(req, project_id="test-proj")
+        contents = res["request"]["contents"]
+
+        # Historic turn 0 image must be collapsed into lightweight text placeholder
+        first_turn_parts = contents[0]["parts"]
+        first_texts = [p.get("text", "") for p in first_turn_parts]
+        self.assertTrue(any("Image attachment from prior turn" in t for t in first_texts))
+        self.assertFalse(any("inlineData" in p for p in first_turn_parts))
+
+        # Recent turn 48 image must keep full inlineData (found in contents)
+        all_recent_parts = [p for c in contents[20:] for p in c.get("parts", [])]
+        self.assertTrue(any("inlineData" in p for p in all_recent_parts))
+
 
 if __name__ == "__main__":
     unittest.main()
