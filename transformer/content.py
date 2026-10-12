@@ -357,17 +357,21 @@ def convert_anthropic_to_google(
                             tool_args_map[tool_id] = tool_args
                             tool_args_cache.set(tool_id, tool_args)
 
-                    # Restore thought signature if cached
-                    cached_sig = signature_cache.get(tool_id)
+                    # Restore thought signature if cached.
+                    # Sentinel fallback is required: without a thoughtSignature Google
+                    # rejects the WHOLE request with 400 INVALID_ARGUMENT
+                    # ("Function call is missing a thought_signature in functionCall parts"),
+                    # which kills the turn even though nothing is wrong with the model,
+                    # the quota or the account. Same handling as thinking blocks above.
+                    cached_sig = signature_cache.get_or_sentinel(tool_id)
 
                     fc_part: Dict[str, Any] = {
                         "functionCall": {
                             "name": tool_name,
                             "args": tool_args
-                        }
+                        },
+                        "thoughtSignature": cached_sig,
                     }
-                    if cached_sig:
-                        fc_part["thoughtSignature"] = cached_sig
                     parts.append(fc_part)
 
                 # 6. Tool result block (from user)
