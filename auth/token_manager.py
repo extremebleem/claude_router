@@ -180,10 +180,29 @@ class TokenManager:
         if available:
             return available
 
-        # Fallback resilience: If all accounts are in cooldown, don't hard-lock the user!
+        # Resilience: if every account is cooling down, prefer the account whose
+        # cooldown expires soonest instead of wiping the whole cooldown table.
+        # Clearing it entirely caused a retry storm: 429 -> clear -> 429 -> clear,
+        # dozens of identical failed requests per second against an exhausted quota.
         if all_accounts:
-            log(f"[TokenManager] All accounts in cooldown. Automatically resetting cooldowns for retry attempt.", level="WARN")
-            self._exhausted_accounts.clear()
+            known_emails = [a.get("email") for a in all_accounts]
+            soonest: Optional[Tuple[str, str, float]] = None
+            for (e, m), until in self._exhausted_accounts.items():
+                if e not in known_emails:
+                    continue
+                if soonest is None or until < soonest[2]:
+                    soonest = (e, m, until)
+            if soonest:
+                wait = max(0, int(soonest[2] - now))
+                log(
+                    f"[TokenManager] All accounts in cooldown. Nearest reset in {wait}s "
+                    f"({soonest[0]}/{soonest[1]}). Trying it, keeping other cooldowns.",
+                    level="WARN",
+                )
+                for acc in all_accounts:
+                    if acc.get("email") == soonest[0]:
+                        return [acc]
+            log("[TokenManager] All accounts in cooldown, reset time unknown. Trying all.", level="WARN")
             return all_accounts
 
         return []
