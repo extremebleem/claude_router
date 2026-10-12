@@ -29,15 +29,28 @@ class SearchLRUCache:
     def _normalize(query: str) -> str:
         return " ".join(query.lower().strip().split()) if isinstance(query, str) else ""
 
+    def _evict_expired(self, now: float) -> None:
+        """Evicts expired keys from the front of the OrderedDict."""
+        keys_to_del = []
+        for k, (ts, _) in self._cache.items():
+            if now - ts > self.ttl_seconds:
+                keys_to_del.append(k)
+            else:
+                break
+        for k in keys_to_del:
+            del self._cache[k]
+
     def get(self, query: str) -> Optional[List[Dict[str, str]]]:
         key = self._normalize(query)
         if not key:
             return None
+        now = time.time()
         with self._lock:
+            self._evict_expired(now)
             if key not in self._cache:
                 return None
             ts, val = self._cache[key]
-            if time.time() - ts > self.ttl_seconds:
+            if now - ts > self.ttl_seconds:
                 del self._cache[key]
                 return None
             self._cache.move_to_end(key)
@@ -47,10 +60,12 @@ class SearchLRUCache:
         key = self._normalize(query)
         if not key:
             return
+        now = time.time()
         with self._lock:
+            self._evict_expired(now)
             if key in self._cache:
                 self._cache.move_to_end(key)
-            self._cache[key] = (time.time(), results)
+            self._cache[key] = (now, results)
             if len(self._cache) > self.capacity:
                 self._cache.popitem(last=False)
 
@@ -173,7 +188,7 @@ def execute_ddg_search(query: str, num_results: int = 5) -> List[Dict[str, str]]
 def perform_web_search(query: str, num_results: int = 5) -> List[Dict[str, str]]:
     """Tries Bing first for stability, falling back to DuckDuckGo, with bounded LRU caching."""
     cached = search_cache.get(query)
-    if cached is not None:
+    if cached is not None and len(cached) >= num_results:
         return cached[:num_results]
 
     results = execute_bing_search(query, num_results=num_results)
@@ -181,9 +196,16 @@ def perform_web_search(query: str, num_results: int = 5) -> List[Dict[str, str]]
         results = execute_ddg_search(query, num_results=num_results)
 
     if results:
-        search_cache.set(query, results)
+        # If cache already had partial results, merge them preserving order
+        merged = results
+        if cached:
+            seen_urls = {r.get("url") for r in results}
+            for c in cached:
+                if c.get("url") not in seen_urls:
+                    merged.append(c)
+        search_cache.set(query, merged)
 
-    return results
+    return results[:num_results] if results else (cached[:num_results] if cached else [])
 
 
 def format_search_results(query: str, results: List[Dict[str, str]]) -> str:

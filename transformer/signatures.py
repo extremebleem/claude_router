@@ -5,7 +5,7 @@ can restore them even if the client stripped them or pruned history turns.
 """
 
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Any
 
 SIGNATURE_CACHE_TTL = 7200  # 2 hours
 SKIP_SIGNATURE_SENTINEL = "skip_thought_signature_validator"
@@ -62,5 +62,30 @@ class ToolNameCache:
         self._cache.clear()
 
 
+class ToolArgsCache:
+    """Session-level cache preserving input args for tool_use_id across multi-turn histories."""
+    def __init__(self):
+        # tool_use_id -> (args_dict, timestamp)
+        self._cache: Dict[str, Tuple[Dict[str, Any], float]] = {}
+
+    def set(self, tool_use_id: str, args: Dict[str, Any]):
+        if not tool_use_id or not isinstance(args, dict):
+            return
+        self._cache[tool_use_id] = (args, time.time())
+
+    def get(self, tool_use_id: str) -> Optional[Dict[str, Any]]:
+        if not tool_use_id or tool_use_id not in self._cache:
+            return None
+        args, ts = self._cache[tool_use_id]
+        if time.time() - ts > SIGNATURE_CACHE_TTL:
+            del self._cache[tool_use_id]
+            return None
+        return args
+
+    def clear(self):
+        self._cache.clear()
+
+
 signature_cache = SignatureCache()
 tool_name_cache = ToolNameCache()
+tool_args_cache = ToolArgsCache()

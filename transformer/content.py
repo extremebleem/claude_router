@@ -11,7 +11,7 @@ import re
 from typing import Dict, Any, List, Optional, Tuple, Union
 
 from transformer.schema import sanitize_schema
-from transformer.signatures import signature_cache, tool_name_cache, SKIP_SIGNATURE_SENTINEL
+from transformer.signatures import signature_cache, tool_name_cache, tool_args_cache, SKIP_SIGNATURE_SENTINEL
 from transformer.prompts import build_system_instruction, ANTIGRAVITY_BASE_PROMPT
 from transformer.search import enrich_empty_search_result
 from transformer.streamer import estimate_request_tokens
@@ -55,22 +55,33 @@ def truncate_tool_output(
         return output_text
 
     lines = output_text.splitlines()
-    if len(lines) > max_lines:
-        omitted_lines = len(lines) - head_lines - tail_lines
-        if omitted_lines > 0:
+    num_lines = len(lines)
+    char_len = len(output_text)
+
+    # 1. Truncate by lines if excessive and head+tail < total lines
+    if num_lines > max_lines:
+        if head_lines + tail_lines < num_lines:
             head = "\n".join(lines[:head_lines])
-            tail = "\n".join(lines[-tail_lines:])
-            omitted_chars = len(output_text) - len(head) - len(tail)
+            tail = "\n".join(lines[-tail_lines:]) if tail_lines > 0 else ""
+            omitted_lines = num_lines - head_lines - tail_lines
+            omitted_chars = max(0, char_len - len(head) - len(tail))
             return (
                 f"{head}\n\n"
                 f"[... Omitted {omitted_lines} lines (~{omitted_chars} chars) by proxy to optimize context window ...]\n\n"
                 f"{tail}"
             )
 
-    if len(output_text) > max_chars:
-        # Budget chars equally for head and tail
+    # 2. Truncate by character budget if output is still excessively long
+    if char_len > max_chars:
+        if max_chars < 200:
+            half = max(10, max_chars // 2)
+            head_part = output_text[:half]
+            tail_part = output_text[-half:] if half > 0 else ""
+            omitted = max(0, char_len - len(head_part) - len(tail_part))
+            return f"{head_part}\n[... Omitted ~{omitted} chars ...]\n{tail_part}"
+
         half = (max_chars - 200) // 2
-        omitted_chars = len(output_text) - 2 * half
+        omitted_chars = max(0, char_len - 2 * half)
         return (
             f"{output_text[:half]}\n\n"
             f"[... Omitted ~{omitted_chars} chars by proxy to optimize context window ...]\n\n"
@@ -88,10 +99,15 @@ def calculate_thinking_budget(
     """
     Calculates token-aware dynamic thinking budget based on prompt token count.
     Scales down for larger context windows to prevent token waste and latency explosion.
+    Respects explicit user_budget=0 to allow disabling thinking.
     """
+    # 0. Explicit disable
+    if user_budget == 0:
+        return 0
+
     m = model.lower()
     # 1. Base budget
-    if user_budget is not None:
+    if user_budget is not None and user_budget > 0:
         budget = user_budget
     elif "claude" in m:
         budget = 32000
@@ -114,7 +130,7 @@ def calculate_thinking_budget(
     max_ceiling = 24576 if "2.5" in m else 64000
     budget = min(budget, max_ceiling)
 
-    # 4. Minimum floor
+    # 4. Minimum floor (respects explicit user_budget=0 disable)
     return max(budget, 1024)
 
 
@@ -280,6 +296,7 @@ def convert_anthropic_to_google(
                         tool_name_cache.set(tool_id, tool_name)
                         if isinstance(tool_args, dict):
                             tool_args_map[tool_id] = tool_args
+                            tool_args_cache.set(tool_id, tool_args)
 
                     # Restore thought signature if cached
                     cached_sig = signature_cache.get(tool_id)
@@ -298,7 +315,7 @@ def convert_anthropic_to_google(
                 elif b_type == "tool_result":
                     tool_id = block.get("tool_use_id", "")
                     tool_name = tool_name_map.get(tool_id) or tool_name_cache.get(tool_id, "unknown_tool")
-                    tool_input_args = tool_args_map.get(tool_id)
+                    tool_input_args = tool_args_map.get(tool_id) or tool_args_cache.get(tool_id)
                     raw_res = block.get("content", "")
                     extracted_images = []
 

@@ -5,6 +5,7 @@ Integration test for server.py HTTP endpoints using aiohttp test client.
 import sys
 import os
 import unittest
+from unittest.mock import AsyncMock, patch, MagicMock
 from aiohttp.test_utils import AioHTTPTestCase, unittest_run_loop
 from aiohttp import web
 
@@ -251,6 +252,100 @@ class TestServerEndpoints(AioHTTPTestCase):
         data_real_danger = await resp_real_danger.json()
         self.assertIn("<block>yes</block>", data_real_danger["content"][0]["text"])
         self.assertIn("Blocked dangerous system command: rm -rf /", data_real_danger["content"][0]["text"])
+
+        # 6. History isolation: dangerous command mentioned in previous assistant response
+        # should NOT trigger guardrail block when current candidate action is safe
+        chat_with_assistant_history_body = {
+            "stop_sequences": ["</block>"],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "How do I wipe everything in Linux?"
+                },
+                {
+                    "role": "assistant",
+                    "content": "You would use rm -rf / but that is dangerous."
+                },
+                {
+                    "role": "user",
+                    "content": "<transcript>\n{\"Bash\": \"ls -la\"}\n</transcript>\nJudge action."
+                }
+            ]
+        }
+        resp_history = await self.client.post("/v1/messages", json=chat_with_assistant_history_body, headers=headers)
+        self.assertEqual(resp_history.status, 200)
+        data_history = await resp_history.json()
+        self.assertIn("<block>no</block>", data_history["content"][0]["text"])
+
+    @unittest_run_loop
+    async def test_classifier_request_detection_isolation(self):
+        # Verify that normal chat messages mentioning classifier words in history
+        # are NOT falsely recognized as classifier requests unless current request parameters match
+        headers = {"Authorization": "Bearer secret_sandbox_token"}
+
+        chat_body = {
+            "messages": [
+                {"role": "user", "content": "Tell me about <transcript> and how classifier works with </block>"}
+            ]
+        }
+        # In test mode without upstream Google credentials, normal message will attempt get_backend_stream
+        # which returns error or 500, but NOT classifier stub 200 with <block>no</block>
+        req = web.Request
+        is_clf = self.proxy.is_classifier_request(req, chat_body)
+        self.assertFalse(is_clf)
+
+        # But with querySource or stop_sequences, it IS a classifier request
+        clf_body1 = {"querySource": "auto_mode", "messages": [{"role": "user", "content": "hi"}]}
+        self.assertTrue(self.proxy.is_classifier_request(req, clf_body1))
+
+        clf_body2 = {"stop_sequences": ["</block>"], "messages": [{"role": "user", "content": "hi"}]}
+        self.assertTrue(self.proxy.is_classifier_request(req, clf_body2))
+
+        clf_body3 = {"max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]}
+        mock_req = type("MockReq", (), {"headers": {"x-claude-code-request-class": "auxiliary"}})()
+        self.assertTrue(self.proxy.is_classifier_request(mock_req, clf_body3))
+
+    @unittest_run_loop
+    async def test_streaming_client_abrupt_disconnect(self):
+        # Test graceful handling when client disconnects during classifier stub streaming
+        headers = {"Authorization": "Bearer secret_sandbox_token"}
+        body = {
+            "querySource": "auto_mode",
+            "stream": True,
+            "messages": [{"role": "user", "content": "git status"}]
+        }
+        # Connect and close immediately
+        resp = await self.client.post("/v1/messages", json=body, headers=headers)
+        self.assertEqual(resp.status, 200)
+        # In aiohttp client response, close() is synchronous
+        resp.close()
+
+    @unittest_run_loop
+    async def test_upstream_streaming_disconnect_resilience(self):
+        # Verify handle_messages catches ConnectionResetError during upstream streaming
+        # and cleanly closes upstream_resp without raising
+        mock_upstream_resp = MagicMock()
+        mock_upstream_resp.close = MagicMock()
+
+        # Generate sample SSE chunk
+        async def mock_content_iter():
+            yield b'data: {"candidates": [{"content": {"parts": [{"text": "Hello"}]}}]}\n\n'
+
+        mock_upstream_resp.content = mock_content_iter()
+
+        with patch.object(self.proxy, "get_backend_stream", new=AsyncMock(return_value=(mock_upstream_resp, "gemini-3.8-flash-tiered"))):
+            # Directly test handle_messages with mock request and simulated ConnectionResetError in prepare
+            mock_request = MagicMock(spec=web.Request)
+            mock_request.json = AsyncMock(return_value={
+                "stream": True,
+                "messages": [{"role": "user", "content": "Hello world"}]
+            })
+            mock_request.headers = {}
+
+            with patch("aiohttp.web.StreamResponse.prepare", side_effect=ConnectionResetError("Simulated client disconnect")):
+                resp = await self.proxy.handle_messages(mock_request)
+                self.assertIsInstance(resp, web.StreamResponse)
+                mock_upstream_resp.close.assert_called_once()
 
 
 if __name__ == "__main__":

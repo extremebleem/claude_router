@@ -48,9 +48,10 @@ class TestThinkingScaling(unittest.TestCase):
         self.assertEqual(calculate_thinking_budget("claude-3-7-sonnet", 400000, user_budget=8000), 4096)
 
     def test_minimum_floor(self):
-        # Never drop below 1024 tokens
+        # Never drop below 1024 tokens unless explicitly disabled with 0
         self.assertEqual(calculate_thinking_budget("claini-custom", 500000, user_budget=500), 1024)
         self.assertEqual(calculate_thinking_budget("gemini-2.5-flash", 500000, user_budget=200), 1024)
+        self.assertEqual(calculate_thinking_budget("gemini-2.5-flash", 500000, user_budget=0), 0)
 
     def test_model_maximum_ceiling(self):
         # Model maximum: respect existing ceiling (e.g. 24576 for 2.5, 64000 for 3.0+)

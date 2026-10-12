@@ -71,6 +71,16 @@ class TestToolOutputTruncation(unittest.TestCase):
         self.assertTrue(output.startswith("entry 0\n"))
         self.assertTrue(output.endswith("\nentry 999"))
 
+    def test_truncation_edge_cases(self):
+        # 1. Custom head and tail lines exceeding total lines -> no corrupt negative omission
+        lines = [f"line {i}" for i in range(100)]
+        text = "\n".join(lines)
+        self.assertEqual(truncate_tool_output(text, max_lines=50, head_lines=80, tail_lines=80), text)
+
+        # 2. Very small max_chars (< 200) -> safe positive slices without crashing
+        short_bound = truncate_tool_output("abcdefghijklmnopqrstuvwxyz", max_chars=10, max_lines=100)
+        self.assertIn("Omitted", short_bound)
+
 
 if __name__ == "__main__":
     unittest.main()
