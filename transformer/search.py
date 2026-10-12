@@ -10,11 +10,57 @@ import urllib.request
 import urllib.parse
 import base64
 import time
+import threading
+from collections import OrderedDict
 from typing import List, Dict, Any, Optional, Tuple
 from logger import log
 
-_SEARCH_CACHE: Dict[str, Tuple[float, List[Dict[str, str]]]] = {}
-CACHE_TTL = 600.0  # 10 minutes cache
+
+class SearchLRUCache:
+    """Thread-safe bounded LRU cache with TTL for web search results."""
+
+    def __init__(self, capacity: int = 256, ttl_seconds: float = 900.0):
+        self.capacity = capacity
+        self.ttl_seconds = ttl_seconds
+        self._lock = threading.Lock()
+        self._cache: OrderedDict[str, Tuple[float, List[Dict[str, str]]]] = OrderedDict()
+
+    @staticmethod
+    def _normalize(query: str) -> str:
+        return " ".join(query.lower().strip().split()) if isinstance(query, str) else ""
+
+    def get(self, query: str) -> Optional[List[Dict[str, str]]]:
+        key = self._normalize(query)
+        if not key:
+            return None
+        with self._lock:
+            if key not in self._cache:
+                return None
+            ts, val = self._cache[key]
+            if time.time() - ts > self.ttl_seconds:
+                del self._cache[key]
+                return None
+            self._cache.move_to_end(key)
+            return val
+
+    def set(self, query: str, results: List[Dict[str, str]]) -> None:
+        key = self._normalize(query)
+        if not key:
+            return
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+            self._cache[key] = (time.time(), results)
+            if len(self._cache) > self.capacity:
+                self._cache.popitem(last=False)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._cache.clear()
+
+
+search_cache = SearchLRUCache(capacity=256, ttl_seconds=900.0)
+CACHE_TTL = 900.0
 
 
 def clean_search_query(query: str) -> str:
@@ -125,20 +171,17 @@ def execute_ddg_search(query: str, num_results: int = 5) -> List[Dict[str, str]]
 
 
 def perform_web_search(query: str, num_results: int = 5) -> List[Dict[str, str]]:
-    """Tries Bing first for stability, falling back to DuckDuckGo, with local caching."""
-    clean_q = clean_search_query(query)
-    now = time.time()
-    if clean_q and clean_q in _SEARCH_CACHE:
-        cached_time, cached_res = _SEARCH_CACHE[clean_q]
-        if now - cached_time < CACHE_TTL:
-            return cached_res[:num_results]
+    """Tries Bing first for stability, falling back to DuckDuckGo, with bounded LRU caching."""
+    cached = search_cache.get(query)
+    if cached is not None:
+        return cached[:num_results]
 
     results = execute_bing_search(query, num_results=num_results)
     if not results:
         results = execute_ddg_search(query, num_results=num_results)
 
-    if results and clean_q:
-        _SEARCH_CACHE[clean_q] = (now, results)
+    if results:
+        search_cache.set(query, results)
 
     return results
 
@@ -186,10 +229,10 @@ def enrich_empty_search_result(tool_name: str, content: str, input_args: Optiona
             is_empty = True
 
     if is_empty and query:
-        log(f"[WebSearch Enricher] Обнаружен пустой результат поиска для '{query}'. Выполняю поиск через прокси...")
+        log(f"[WebSearch Enricher] Empty search result detected for '{query}'. Performing web search via proxy...")
         results = perform_web_search(query, num_results=5)
         if results:
-            log(f"[WebSearch Enricher] Успешно получено {len(results)} результатов для '{query}'")
+            log(f"[WebSearch Enricher] Successfully retrieved {len(results)} results for '{query}'")
             return format_search_results(query, results)
 
     return content
