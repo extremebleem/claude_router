@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Claude-Gemini Proxy | Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-base: #090d16;
+            --bg-surface: #101726;
+            --bg-card: #151f33;
+            --bg-card-hover: #1b2740;
+            --border: #22314d;
+            --border-highlight: #3b82f6;
+            --text-main: #f1f5f9;
+            --text-muted: #94a3b8;
+            --text-dim: #64748b;
+            --accent-blue: #38bdf8;
+            --accent-indigo: #818cf8;
+            --accent-green: #34d399;
+            --accent-yellow: #fbbf24;
+            --accent-red: #f87171;
+            --font-sans: 'Plus Jakarta Sans', system-ui, sans-serif;
+            --font-mono: 'JetBrains Mono', monospace;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background-color: var(--bg-base);
+            color: var(--text-main);
+            font-family: var(--font-sans);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            line-height: 1.5;
+        }
+
+        header {
+            background: rgba(16, 23, 38, 0.8);
+            backdrop-filter: blur(12px);
+            border-bottom: 1px solid var(--border);
+            padding: 1rem 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            position: sticky;
+            top: 0;
+            z-index: 50;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .brand-badge {
+            background: linear-gradient(135deg, #38bdf8, #818cf8);
+            color: #000;
+            font-weight: 700;
+            font-size: 0.85rem;
+            padding: 0.35rem 0.6rem;
+            border-radius: 8px;
+            font-family: var(--font-mono);
+        }
+
+        .brand-title {
+            font-size: 1.25rem;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+        }
+
+        .header-actions {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .status-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            background: rgba(52, 211, 153, 0.1);
+            border: 1px solid rgba(52, 211, 153, 0.3);
+            color: var(--accent-green);
+            padding: 0.35rem 0.85rem;
+            border-radius: 9999px;
+            font-size: 0.85rem;
+            font-weight: 600;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            background: var(--accent-green);
+            border-radius: 50%;
+            box-shadow: 0 0 10px var(--accent-green);
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.4; transform: scale(0.9); }
+        }
+
+        .btn {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            color: var(--text-main);
+            padding: 0.5rem 1rem;
+            border-radius: 8px;
+            font-size: 0.875rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-family: var(--font-sans);
+        }
+
+        .btn:hover {
+            background: var(--bg-card-hover);
+            border-color: var(--border-highlight);
+            color: #fff;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #2563eb, #38bdf8);
+            border: none;
+            color: #fff;
+        }
+
+        .btn-primary:hover {
+            opacity: 0.9;
+        }
+
+        main {
+            flex: 1;
+            max-width: 1400px;
+            width: 100%;
+            margin: 0 auto;
+            padding: 2rem;
+            display: flex;
+            flex-direction: column;
+            gap: 2rem;
+        }
+
+        /* Stats Grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 1.25rem;
+        }
+
+        .stat-card {
+            background: var(--bg-surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 1.25rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.35rem;
+        }
+
+        .stat-label {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            font-weight: 600;
+        }
+
+        .stat-value {
+            font-size: 1.85rem;
+            font-weight: 700;
+            font-family: var(--font-mono);
+            color: var(--text-main);
+        }
+
+        .stat-sub {
+            font-size: 0.8rem;
+            color: var(--text-dim);
+        }
+
+        /* Section Layout */
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+        }
+
+        .section-title {
+            font-size: 1.15rem;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        /* Accounts Pool Grid */
+        .accounts-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+            gap: 1.25rem;
+        }
+
+        .account-card {
+            background: var(--bg-surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 1.25rem;
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+            position: relative;
+            transition: all 0.2s ease;
+        }
+
+        .account-card.active {
+            border-color: var(--accent-blue);
+            box-shadow: 0 0 20px rgba(56, 189, 248, 0.15);
+        }
+
+        .account-card:hover {
+            border-color: var(--border-highlight);
+        }
+
+        .account-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+        }
+
+        .account-email {
+            font-weight: 700;
+            font-size: 0.95rem;
+            word-break: break-all;
+        }
+
+        .account-tier {
+            font-family: var(--font-mono);
+            font-size: 0.75rem;
+            padding: 0.2rem 0.5rem;
+            border-radius: 6px;
+            background: rgba(129, 140, 248, 0.15);
+            color: var(--accent-indigo);
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .account-meta {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            display: flex;
+            flex-direction: column;
+            gap: 0.25rem;
+        }
+
+        .account-cooldown {
+            background: rgba(248, 113, 113, 0.1);
+            border: 1px solid rgba(248, 113, 113, 0.3);
+            color: var(--accent-red);
+            font-size: 0.8rem;
+            padding: 0.4rem 0.6rem;
+            border-radius: 6px;
+            font-family: var(--font-mono);
+        }
+
+        /* Quotas Grid */
+        .quotas-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 1.25rem;
+        }
+
+        .quota-card {
+            background: var(--bg-surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 1.25rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        .quota-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .quota-model-name {
+            font-size: 0.9rem;
+            font-weight: 700;
+            font-family: var(--font-mono);
+        }
+
+        .quota-percent {
+            font-family: var(--font-mono);
+            font-weight: 700;
+            font-size: 1.1rem;
+        }
+
+        .progress-bar-bg {
+            background: var(--bg-card);
+            border-radius: 9999px;
+            height: 10px;
+            overflow: hidden;
+            width: 100%;
+        }
+
+        .progress-bar-fill {
+            height: 100%;
+            border-radius: 9999px;
+            transition: width 0.4s ease, background-color 0.4s ease;
+        }
+
+        .quota-footer {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.75rem;
+            color: var(--text-dim);
+        }
+
+        /* Recent Requests Table */
+        .table-container {
+            background: var(--bg-surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.875rem;
+            text-align: left;
+        }
+
+        th {
+            background: rgba(21, 31, 51, 0.5);
+            padding: 0.85rem 1.25rem;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+            border-bottom: 1px solid var(--border);
+        }
+
+        td {
+            padding: 0.85rem 1.25rem;
+            border-bottom: 1px solid rgba(34, 49, 77, 0.5);
+            font-family: var(--font-mono);
+            font-size: 0.8rem;
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        tr:hover td {
+            background: rgba(27, 39, 64, 0.5);
+        }
+
+        .badge-status {
+            display: inline-block;
+            padding: 0.2rem 0.5rem;
+            border-radius: 6px;
+            font-size: 0.75rem;
+            font-weight: 700;
+        }
+
+        .badge-200 { background: rgba(52, 211, 153, 0.15); color: var(--accent-green); }
+        .badge-429 { background: rgba(251, 191, 36, 0.15); color: var(--accent-yellow); }
+        .badge-err { background: rgba(248, 113, 113, 0.15); color: var(--accent-red); }
+
+        footer {
+            margin-top: auto;
+            border-top: 1px solid var(--border);
+            padding: 1.5rem 2rem;
+            text-align: center;
+            font-size: 0.85rem;
+            color: var(--text-dim);
+        }
+    </style>
+</head>
+<body>
+
+    <header>
+        <div class="brand">
+            <span class="brand-badge">PROXY</span>
+            <h1 class="brand-title">Claude-Gemini Dashboard</h1>
+        </div>
+        <div class="header-actions">
+            <div class="status-pill">
+                <span class="status-dot"></span>
+                <span>СЕРВЕР АКТИВЕН</span>
+            </div>
+            <button class="btn" onclick="fetchData()">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+                Обновить
+            </button>
+        </div>
+    </header>
+
+    <main>
+        <!-- Top Statistics -->
+        <section class="stats-grid">
+            <div class="stat-card">
+                <span class="stat-label">Всего запросов</span>
+                <span class="stat-value" id="stat-total-requests">0</span>
+                <span class="stat-sub">с момента старта сервера</span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-label">��ктивный аккаунт</span>
+                <span class="stat-value" style="font-size: 1.1rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" id="stat-active-account">-</span>
+                <span class="stat-sub" id="stat-active-tier">План: неизвестен</span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-label">Пул Google аккаунтов</span>
+                <span class="stat-value" id="stat-total-accounts">0</span>
+                <span class="stat-sub">с авто-переключением на 429</span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-label">Gemini Studio Fallback</span>
+                <span class="stat-value" style="font-size: 1.2rem;" id="stat-gemini-fallback">-</span>
+                <span class="stat-sub">резервная линия отказоустойчивости</span>
+            </div>
+        </section>
+
+        <!-- Quota Progress Bars -->
+        <section>
+            <div class="section-header">
+                <h2 class="section-title">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+                    Остаток квот моделей (Активный аккаунт)
+                </h2>
+                <span style="font-size: 0.85rem; color: var(--text-dim);" id="quotas-timestamp">Обновлено: -</span>
+            </div>
+            <div class="quotas-grid" id="quotas-container">
+                <div style="color: var(--text-muted); font-size: 0.9rem;">Загрузка квот...</div>
+            </div>
+        </section>
+
+        <!-- Accounts Pool Grid -->
+        <section>
+            <div class="section-header">
+                <h2 class="section-title">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+                    Пул подключенных Google аккаунтов
+                </h2>
+            </div>
+            <div class="accounts-grid" id="accounts-container">
+                <div style="color: var(--text-muted); font-size: 0.9rem;">Загрузка аккаунтов...</div>
+            </div>
+        </section>
+
+        <!-- Recent Requests -->
+        <section>
+            <div class="section-header">
+                <h2 class="section-title">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                    Недавние запросы к прокси
+                </h2>
+            </div>
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Время</th>
+                            <th>ID запроса</th>
+                            <th>Модель</th>
+                            <th>Аккаунт</th>
+                            <th>Тип</th>
+                            <th>Статус</th>
+                            <th>Задержка</th>
+                        </tr>
+                    </thead>
+                    <tbody id="requests-tbody">
+                        <tr>
+                            <td colspan="7" style="text-align: center; color: var(--text-dim); padding: 2rem;">
+                                Запросов пока не зафиксировано
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+
+    <footer>
+        Claude-Gemini Proxy &copy; 2026 &bull; Antigravity Engine &bull; Port: <span id="footer-port">8080</span>
+    </footer>
+
+    <script>
+        async function fetchData() {
+            try {
+                // 1. Fetch Health and Stats
+                const statsRes = await fetch('/api/stats');
+                if (statsRes.ok) {
+                    const stats = await statsRes.json();
+                    document.getElementById('stat-total-requests').textContent = stats.total_requests || 0;
+                    document.getElementById('stat-active-account').textContent = stats.active_account || '-';
+                    document.getElementById('stat-active-tier').textContent = `План: ${(stats.tier || 'free').toUpperCase()}`;
+                    document.getElementById('stat-total-accounts').textContent = stats.total_accounts || 1;
+                    document.getElementById('stat-gemini-fallback').textContent = stats.direct_gemini_api ? 'Включен ✓' : 'Не задан ✕';
+                    document.getElementById('stat-gemini-fallback').style.color = stats.direct_gemini_api ? 'var(--accent-green)' : 'var(--text-dim)';
+                }
+
+                // 2. Fetch Accounts
+                const accsRes = await fetch('/accounts');
+                if (accsRes.ok) {
+                    const accsData = await accsRes.json();
+                    renderAccounts(accsData.accounts || []);
+                }
+
+                // 3. Fetch Limits and Quotas
+                const limitsRes = await fetch('/account-limits?format=json');
+                if (limitsRes.ok) {
+                    const limitsData = await limitsRes.json();
+                    renderQuotas(limitsData);
+                }
+
+                // 4. Fetch Recent Requests
+                const eventsRes = await fetch('/api/events');
+                if (eventsRes.ok) {
+                    const events = await eventsRes.json();
+                    renderEvents(events.events || []);
+                }
+
+                document.getElementById('footer-port').textContent = window.location.port || '80';
+            } catch (err) {
+                console.error("Error fetching dashboard data:", err);
+            }
+        }
+
+        function renderAccounts(accounts) {
+            const container = document.getElementById('accounts-container');
+            if (!accounts.length) {
+                container.innerHTML = '<div style="color: var(--text-dim);">Нет сохраненных аккаунтов.</div>';
+                return;
+            }
+
+            container.innerHTML = accounts.map(acc => {
+                const isActive = acc.is_active;
+                const cooldowns = Object.entries(acc.cooldowns || {});
+                const hasCooldown = cooldowns.length > 0;
+
+                return `
+                    <div class="account-card ${isActive ? 'active' : ''}">
+                        <div class="account-header">
+                            <div>
+                                <div class="account-email">${acc.email}</div>
+                                <div style="font-size: 0.75rem; color: var(--text-dim); margin-top: 2px;">
+                                    ${acc.project_id ? 'GCP: ' + acc.project_id : 'Локальная сессия'}
+                                </div>
+                            </div>
+                            <span class="account-tier">${acc.tier}</span>
+                        </div>
+
+                        ${hasCooldown ? `
+                            <div class="account-cooldown">
+                                ⚠️ 429 Кулдаун: ${cooldowns.map(([m, s]) => `${m} (${Math.round(s)}с)`).join(', ')}
+                            </div>
+                        ` : ''}
+
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-top: auto;">
+                            <span style="font-size: 0.8rem; color: ${isActive ? 'var(--accent-green)' : 'var(--text-dim)'}; font-weight: 600;">
+                                ${isActive ? '● АКТИВЕН' : 'Готов к работе'}
+                            </span>
+                            ${!isActive ? `
+                                <button class="btn" style="padding: 0.35rem 0.75rem; font-size: 0.8rem;" onclick="switchAccount('${acc.email}')">
+                                    Активировать
+                                </button>
+                            ` : ''}
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        async function switchAccount(email) {
+            try {
+                const res = await fetch('/accounts/switch', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email })
+                });
+                if (res.ok) {
+                    await fetchData();
+                } else {
+                    alert('Ошибка переключения аккаунта');
+                }
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        function renderQuotas(data) {
+            const container = document.getElementById('quotas-container');
+            const accounts = data.accounts || [];
+            if (!accounts.length) {
+                container.innerHTML = '<div style="color: var(--text-dim);">Квоты не загружены.</div>';
+                return;
+            }
+
+            document.getElementById('quotas-timestamp').textContent = `Обновлено: ${data.timestamp || 'только что'}`;
+
+            // Find active account or first
+            const activeAcc = accounts[0];
+            const limits = activeAcc.limits || {};
+            const keys = Object.keys(limits);
+
+            if (!keys.length) {
+                container.innerHTML = '<div style="color: var(--text-dim);">Нет доступных квот для отображения.</div>';
+                return;
+            }
+
+            container.innerHTML = keys.map(model => {
+                const q = limits[model];
+                const fraction = q.remainingFraction != null ? q.remainingFraction : 1.0;
+                const percent = Math.round(fraction * 100);
+
+                let color = 'var(--accent-green)';
+                if (percent < 30) color = 'var(--accent-red)';
+                else if (percent < 70) color = 'var(--accent-yellow)';
+
+                return `
+                    <div class="quota-card">
+                        <div class="quota-header">
+                            <span class="quota-model-name">${model}</span>
+                            <span class="quota-percent" style="color: ${color};">${percent}%</span>
+                        </div>
+                        <div class="progress-bar-bg">
+                            <div class="progress-bar-fill" style="width: ${percent}%; background-color: ${color};"></div>
+                        </div>
+                        <div class="quota-footer">
+                            <span>Остаток: ${percent}%</span>
+                            <span>Сброс: ${q.resetTime ? q.resetTime.substring(11, 19) + ' UTC' : '-'}</span>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function renderEvents(events) {
+            const tbody = document.getElementById('requests-tbody');
+            if (!events.length) {
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="7" style="text-align: center; color: var(--text-dim); padding: 2rem;">
+                            Запросов пока не зафиксировано
+                        </td>
+                    </tr>
+                `;
+                return;
+            }
+
+            tbody.innerHTML = events.slice(0, 15).map(ev => {
+                const statusClass = ev.status === 200 ? 'badge-200' : (ev.status === 429 ? 'badge-429' : 'badge-err');
+                return `
+                    <tr>
+                        <td style="color: var(--text-muted);">${ev.time}</td>
+                        <td>${ev.req_id}</td>
+                        <td style="color: var(--accent-blue);">${ev.model}</td>
+                        <td>${ev.account}</td>
+                        <td>${ev.stream ? 'SSE Stream' : 'JSON'}</td>
+                        <td><span class="badge-status ${statusClass}">${ev.status}</span></td>
+                        <td>${ev.latency ? ev.latency + 'ms' : '-'}</td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        // Initial fetch and auto-refresh every 5 seconds
+        fetchData();
+        setInterval(fetchData, 5000);
+    </script>
+</body>
+</html>

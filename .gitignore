@@ -1,0 +1,28 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Claude Gemini Proxy private data
+logs/
+*.log
+req_*.json
+accounts.json
+
+# Scratch & Sandbox
+scratch/
+.claude-sandbox/
+.claude/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+Desktop.ini
