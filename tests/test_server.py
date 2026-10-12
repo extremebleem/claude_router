@@ -203,6 +203,55 @@ class TestServerEndpoints(AioHTTPTestCase):
         self.assertIn("<block>yes</block>", data_danger["content"][0]["text"])
         self.assertIn("Blocked dangerous system command", data_danger["content"][0]["text"])
 
+        # 3. Realistic Claude Code payload with 'rm -rf /' in SYSTEM prompt, but SAFE command in transcript
+        realistic_safe_body = {
+            "stop_sequences": ["</block>"],
+            "system": "You are a classifier. Block dangerous actions like `rm -rf /` or `rm -rf ~`. Err on the side of blocking.",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "<transcript>\n{\"Bash\": \"git status\"}\n{\"Bash\": \"python cli_auth.py pool\"}\n</transcript>\nErr on the side of blocking."
+                }
+            ]
+        }
+        resp_real_safe = await self.client.post("/v1/messages", json=realistic_safe_body, headers=headers)
+        self.assertEqual(resp_real_safe.status, 200)
+        data_real_safe = await resp_real_safe.json()
+        self.assertIn("<block>no</block>", data_real_safe["content"][0]["text"])
+
+        # 4. Realistic Claude Code payload with Fetch command
+        realistic_fetch_body = {
+            "stop_sequences": ["</block>"],
+            "system": "Examples of bad commands: rm -rf /, format C:",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "<transcript>\n{\"Fetch\": \"http://127.0.0.1:62289/account-limits\"}\n</transcript>\nJudge action."
+                }
+            ]
+        }
+        resp_fetch = await self.client.post("/v1/messages", json=realistic_fetch_body, headers=headers)
+        self.assertEqual(resp_fetch.status, 200)
+        data_fetch = await resp_fetch.json()
+        self.assertIn("<block>no</block>", data_fetch["content"][0]["text"])
+
+        # 5. Realistic Claude Code payload with ACTUAL destructive command inside transcript
+        realistic_danger_body = {
+            "stop_sequences": ["</block>"],
+            "system": "You are a safety filter.",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "<transcript>\n{\"Bash\": \"python cli_auth.py\"}\n{\"meta\": {\"gitStatus\": \"clean\"}}\n{\"Bash\": \"rm -rf /\"}\n</transcript>\n"
+                }
+            ]
+        }
+        resp_real_danger = await self.client.post("/v1/messages", json=realistic_danger_body, headers=headers)
+        self.assertEqual(resp_real_danger.status, 200)
+        data_real_danger = await resp_real_danger.json()
+        self.assertIn("<block>yes</block>", data_real_danger["content"][0]["text"])
+        self.assertIn("Blocked dangerous system command: rm -rf /", data_real_danger["content"][0]["text"])
+
 
 if __name__ == "__main__":
     unittest.main()

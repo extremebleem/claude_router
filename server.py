@@ -355,28 +355,48 @@ class ProxyApp:
         return False
 
     def detect_dangerous_command(self, body: dict) -> Optional[str]:
-        """Inspects classifier payload for high-risk / destructive commands."""
-        text_chunks = []
-        sys_val = body.get("system")
-        if isinstance(sys_val, str):
-            text_chunks.append(sys_val)
-        elif isinstance(sys_val, list):
-            for b in sys_val:
-                if isinstance(b, dict) and "text" in b:
-                    text_chunks.append(b["text"])
-
+        """Inspects classifier payload for high-risk / destructive commands.
+        CRITICAL: Never inspect body['system'], as it contains classifier instructions
+        and prompt examples (like 'rm -rf /') which causes false positives on every request!
+        """
+        # 1. Collect message content only (ignoring system prompt entirely)
+        msg_parts = []
         for m in body.get("messages", []):
             content = m.get("content")
             if isinstance(content, str):
-                text_chunks.append(content)
+                msg_parts.append(content)
             elif isinstance(content, list):
                 for c in content:
                     if isinstance(c, dict) and "text" in c:
-                        text_chunks.append(c["text"])
+                        msg_parts.append(c["text"])
 
-        combined = " ".join(text_chunks)
+        full_msg = "\n".join(msg_parts)
+        if not full_msg:
+            return None
+
+        # 2. Extract the actual action under review
+        # Claude Code encloses session transcript in <transcript>...</transcript>.
+        # The line directly above </transcript> (excluding metadata lines) is the action being evaluated.
+        candidate_text = full_msg
+        if "<transcript>" in full_msg and "</transcript>" in full_msg:
+            transcript_content = full_msg.split("<transcript>")[-1].split("</transcript>")[0].strip()
+            lines = [line.strip() for line in transcript_content.splitlines() if line.strip()]
+            for line in reversed(lines):
+                if line.startswith('{"meta"'):
+                    continue
+                candidate_text = line
+                try:
+                    parsed = json.loads(line)
+                    if isinstance(parsed, dict):
+                        # Extract the inner command string from keys like "Bash", "command", etc.
+                        candidate_text = " ".join(str(v) for v in parsed.values())
+                except Exception:
+                    pass
+                break
+
+        # 3. Check only the candidate action against dangerous patterns
         for pattern in DANGEROUS_COMMAND_PATTERNS:
-            m = pattern.search(combined)
+            m = pattern.search(candidate_text)
             if m:
                 return m.group(0)
         return None
