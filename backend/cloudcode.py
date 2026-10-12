@@ -89,6 +89,11 @@ class CloudCodeClient:
 
         last_status = None
         last_err_text = None
+        # Keep the FIRST failure separately. CLOUDCODE_ENDPOINTS is tried in order
+        # (daily first, prod second) and prod often answers 429 even when the real
+        # fault is a 400 from daily. Reporting only the last error hides the cause.
+        first_status = None
+        first_err_text = None
 
         for endpoint in CLOUDCODE_ENDPOINTS:
             url = f"{endpoint}/v1internal:streamGenerateContent?alt=sse"
@@ -134,6 +139,13 @@ class CloudCodeClient:
                     err_text = await resp.text()
                     resp.close()
                     log(f"[CloudCode] [{email}] ✗ HTTP 429 from {endpoint}: {err_text}", level="WARN")
+                    if first_status is None:
+                        first_status, first_err_text = 429, err_text
+                    # A genuine quota error on the first endpoint is the real cause.
+                    # Otherwise report the earlier, more specific failure instead of
+                    # letting this generic 429 mask it.
+                    if first_status != 429:
+                        return None, first_status, first_err_text
                     return None, 429, err_text
 
                 # 403: Forbidden / Permission Denied
@@ -141,6 +153,8 @@ class CloudCodeClient:
                     err_text = await resp.text()
                     resp.close()
                     log(f"[CloudCode] [{email}] ✗ HTTP 403 from {endpoint}: {err_text}", level="ERROR")
+                    if first_status is None:
+                        first_status, first_err_text = 403, err_text
                     last_status = 403
                     last_err_text = err_text
                     continue
@@ -148,15 +162,19 @@ class CloudCodeClient:
                 err_text = await resp.text()
                 resp.close()
                 log(f"[CloudCode] [{email}] ✗ HTTP {resp.status} from {endpoint}: {err_text}", level="ERROR")
+                if first_status is None:
+                    first_status, first_err_text = resp.status, err_text
                 last_status = resp.status
                 last_err_text = err_text
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 log(f"[CloudCode] [{email}] Connection exception to {endpoint}: {e}", level="WARN")
+                if first_status is None:
+                    first_status, first_err_text = None, str(e)
                 last_err_text = str(e)
                 continue
 
-        return None, last_status, last_err_text
+        return None, first_status or last_status, first_err_text or last_err_text
 
     async def generate_content_stream(
         self,
