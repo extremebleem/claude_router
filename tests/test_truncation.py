@@ -81,6 +81,56 @@ class TestToolOutputTruncation(unittest.TestCase):
         short_bound = truncate_tool_output("abcdefghijklmnopqrstuvwxyz", max_chars=10, max_lines=100)
         self.assertIn("Omitted", short_bound)
 
+    def test_historic_tool_collapsing(self):
+        # Build alternating user-model conversation with 50 messages
+        msgs = []
+        for i in range(25):
+            msgs.append({
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": f"call_{i}",
+                        "name": "Bash",
+                        "input": {"command": "test"}
+                    }
+                ]
+            })
+            msgs.append({
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": f"call_{i}",
+                        "content": "\n".join([f"log entry {j}" for j in range(50)])
+                    }
+                ]
+            })
+        req = {
+            "model": "gemini-3.8-flash-tiered",
+            "messages": msgs
+        }
+        res = convert_anthropic_to_google(req, project_id="test-proj")
+        contents = res["request"]["contents"]
+        # Find first functionResponse part (historic) -> must be collapsed
+        first_resp = None
+        for p in contents[2]["parts"]:
+            if "functionResponse" in p:
+                first_resp = p["functionResponse"]["response"]["output"]
+                break
+        self.assertIsNotNone(first_resp)
+        self.assertIn("Prior tool output collapsed", first_resp)
+
+        # Find last functionResponse part (recent, inside last 40 msgs) -> must NOT be collapsed
+        last_resp = None
+        for p in reversed(contents[-1]["parts"]):
+            if "functionResponse" in p:
+                last_resp = p["functionResponse"]["response"]["output"]
+                break
+        self.assertIsNotNone(last_resp)
+        self.assertNotIn("Prior tool output collapsed", last_resp)
+        self.assertIn("log entry 49", last_resp)
+
 
 if __name__ == "__main__":
     unittest.main()

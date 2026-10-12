@@ -91,6 +91,34 @@ def truncate_tool_output(
     return output_text
 
 
+def collapse_historic_tool_output(
+    output_text: str,
+    max_lines: int = 15,
+    max_chars: int = 1500
+) -> str:
+    """
+    Collapses deep historic tool outputs into a lightweight summary.
+    Preserves tool execution awareness while freeing hundreds of thousands of tokens
+    from old turns to prevent 429 RESOURCE_EXHAUSTED errors.
+    """
+    if not isinstance(output_text, str):
+        output_text = str(output_text)
+
+    char_len = len(output_text)
+    lines = output_text.splitlines()
+    num_lines = len(lines)
+
+    if num_lines <= max_lines and char_len <= max_chars:
+        return output_text
+
+    # Keep brief sample of head
+    head = "\n".join(lines[:5])
+    return (
+        f"{head}\n\n"
+        f"[... Prior tool output collapsed ({num_lines} lines, {char_len} chars) to preserve context window ...]"
+    )
+
+
 def calculate_thinking_budget(
     model: str,
     total_prompt_tokens: int,
@@ -219,7 +247,14 @@ def convert_anthropic_to_google(
     tool_name_map: Dict[str, str] = {}
     tool_args_map: Dict[str, Dict[str, Any]] = {}
 
-    for msg in messages:
+    # Total messages in request
+    total_msgs = len(messages)
+    # Active recent window: preserve full output for the most recent 40 messages
+    # Messages older than this threshold have their bulky tool_results safely collapsed
+    recent_window_threshold = max(0, total_msgs - 40)
+
+    for msg_idx, msg in enumerate(messages):
+        is_historic_turn = (msg_idx < recent_window_threshold)
         role = msg.get("role")
         content = msg.get("content")
 
@@ -337,13 +372,21 @@ def convert_anthropic_to_google(
                                     })
                         raw_output = "\n".join(text_items)
                         enriched_output = enrich_empty_search_result(tool_name, raw_output, input_args=tool_input_args)
-                        res_obj = {"output": truncate_tool_output(enriched_output)}
+                        if is_historic_turn:
+                            final_output = collapse_historic_tool_output(enriched_output)
+                        else:
+                            final_output = truncate_tool_output(enriched_output)
+                        res_obj = {"output": final_output}
                     elif isinstance(raw_res, dict):
                         res_obj = raw_res
                     else:
                         raw_output = str(raw_res)
                         enriched_output = enrich_empty_search_result(tool_name, raw_output, input_args=tool_input_args)
-                        res_obj = {"output": truncate_tool_output(enriched_output)}
+                        if is_historic_turn:
+                            final_output = collapse_historic_tool_output(enriched_output)
+                        else:
+                            final_output = truncate_tool_output(enriched_output)
+                        res_obj = {"output": final_output}
 
                     parts.append({
                         "functionResponse": {
