@@ -270,7 +270,10 @@ async def parse_google_sse_stream(
             "stop_sequence": None
         },
         "usage": {
-            "output_tokens": output_tokens
+            "output_tokens": output_tokens,
+            "input_tokens": max(0, input_tokens - cache_read_tokens),
+            "cache_read_input_tokens": cache_read_tokens,
+            "cache_creation_input_tokens": 0
         }
     }
     yield {"type": "message_stop"}
@@ -317,7 +320,14 @@ async def aggregate_sse_stream_to_json(
         elif e_type == "message_delta":
             delta = event.get("delta", {})
             stop_reason = delta.get("stop_reason", stop_reason)
-            usage["output_tokens"] = event.get("usage", {}).get("output_tokens", 0)
+            delta_usage = event.get("usage", {})
+            usage["output_tokens"] = delta_usage.get("output_tokens", 0)
+            if "input_tokens" in delta_usage:
+                usage["input_tokens"] = delta_usage["input_tokens"]
+            if "cache_read_input_tokens" in delta_usage:
+                usage["cache_read_input_tokens"] = delta_usage["cache_read_input_tokens"]
+            if "cache_creation_input_tokens" in delta_usage:
+                usage["cache_creation_input_tokens"] = delta_usage["cache_creation_input_tokens"]
 
     # Finalize tool_use inputs from collected JSON
     for b in content_blocks:
