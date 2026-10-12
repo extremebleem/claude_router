@@ -42,6 +42,43 @@ def scrub_identity(text: str) -> str:
     return text
 
 
+def truncate_tool_output(
+    output_text: str,
+    max_lines: int = 600,
+    max_chars: int = 120000,
+    head_lines: int = 250,
+    tail_lines: int = 250
+) -> str:
+    """Truncates oversized tool outputs preserving head and tail to optimize context window."""
+    if not isinstance(output_text, str):
+        return output_text
+
+    lines = output_text.splitlines()
+    if len(lines) > max_lines:
+        omitted_lines = len(lines) - head_lines - tail_lines
+        if omitted_lines > 0:
+            head = "\n".join(lines[:head_lines])
+            tail = "\n".join(lines[-tail_lines:])
+            omitted_chars = len(output_text) - len(head) - len(tail)
+            return (
+                f"{head}\n\n"
+                f"[... Omitted {omitted_lines} lines (~{omitted_chars} chars) by proxy to optimize context window ...]\n\n"
+                f"{tail}"
+            )
+
+    if len(output_text) > max_chars:
+        # Budget chars equally for head and tail
+        half = (max_chars - 200) // 2
+        omitted_chars = len(output_text) - 2 * half
+        return (
+            f"{output_text[:half]}\n\n"
+            f"[... Omitted ~{omitted_chars} chars by proxy to optimize context window ...]\n\n"
+            f"{output_text[-half:]}"
+        )
+
+    return output_text
+
+
 def derive_session_id(
     messages: List[Dict[str, Any]],
     account_id: str = "",
@@ -125,6 +162,7 @@ def convert_anthropic_to_google(
 
     # Map of tool_use_id -> tool_name (for matching tool_results to functionResponse)
     tool_name_map: Dict[str, str] = {}
+    tool_args_map: Dict[str, Dict[str, Any]] = {}
 
     for msg in messages:
         role = msg.get("role")
@@ -201,6 +239,8 @@ def convert_anthropic_to_google(
                     if tool_id and tool_name:
                         tool_name_map[tool_id] = tool_name
                         tool_name_cache.set(tool_id, tool_name)
+                        if isinstance(tool_args, dict):
+                            tool_args_map[tool_id] = tool_args
 
                     # Restore thought signature if cached
                     cached_sig = signature_cache.get(tool_id)
@@ -219,6 +259,7 @@ def convert_anthropic_to_google(
                 elif b_type == "tool_result":
                     tool_id = block.get("tool_use_id", "")
                     tool_name = tool_name_map.get(tool_id) or tool_name_cache.get(tool_id, "unknown_tool")
+                    tool_input_args = tool_args_map.get(tool_id)
                     raw_res = block.get("content", "")
                     extracted_images = []
 
@@ -239,14 +280,14 @@ def convert_anthropic_to_google(
                                         }
                                     })
                         raw_output = "\n".join(text_items)
-                        enriched_output = enrich_empty_search_result(tool_name, raw_output)
-                        res_obj = {"output": enriched_output}
+                        enriched_output = enrich_empty_search_result(tool_name, raw_output, input_args=tool_input_args)
+                        res_obj = {"output": truncate_tool_output(enriched_output)}
                     elif isinstance(raw_res, dict):
                         res_obj = raw_res
                     else:
                         raw_output = str(raw_res)
-                        enriched_output = enrich_empty_search_result(tool_name, raw_output)
-                        res_obj = {"output": enriched_output}
+                        enriched_output = enrich_empty_search_result(tool_name, raw_output, input_args=tool_input_args)
+                        res_obj = {"output": truncate_tool_output(enriched_output)}
 
                     parts.append({
                         "functionResponse": {
