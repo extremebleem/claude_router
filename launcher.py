@@ -59,6 +59,65 @@ def detect_cli_path() -> Optional[str]:
     return None
 
 
+def link_sandbox_directories(sandbox_path: Path):
+    """
+    Ensures shared resources like custom skills and plugins from ~/.claude
+    are transparently accessible inside the sandbox (~/.claude-sandbox).
+    Uses Directory Junction on Windows or Symlink on POSIX (zero-admin-rights required).
+    """
+    user_home = Path(os.environ.get("USERPROFILE", os.path.expanduser("~")))
+    real_claude = user_home / ".claude"
+    if not real_claude.exists():
+        return
+
+    shared_dirs = ["skills", "plugins"]
+    for dir_name in shared_dirs:
+        source_dir = real_claude / dir_name
+        target_dir = sandbox_path / dir_name
+
+        if not source_dir.exists():
+            continue
+
+        # If target exists but is a plain directory rather than a link, replace it
+        if target_dir.exists():
+            if sys.platform == "win32":
+                res = subprocess.run(
+                    ["cmd", "/c", "fsutil", "reparsepoint", "query", str(target_dir)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+                if res.returncode != 0:
+                    try:
+                        import shutil
+                        shutil.rmtree(target_dir)
+                    except Exception:
+                        continue
+                else:
+                    continue
+            else:
+                if not target_dir.is_symlink():
+                    try:
+                        import shutil
+                        shutil.rmtree(target_dir)
+                    except Exception:
+                        continue
+                else:
+                    continue
+
+        try:
+            if sys.platform == "win32":
+                # Create directory junction (mklink /J does not require Administrator privileges)
+                subprocess.run(
+                    ["cmd", "/c", "mklink", "/J", str(target_dir), str(source_dir)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+            else:
+                target_dir.symlink_to(source_dir, target_is_directory=True)
+        except Exception:
+            pass
+
+
 def start_proxy_thread(port: int, token: str):
     """Runs the aiohttp proxy server in a background thread."""
     import asyncio
@@ -93,6 +152,9 @@ def run_session(exe_path: str, model_override: Optional[str], sandbox_dir: Optio
     sandbox_path = Path(sandbox_dir) if sandbox_dir else user_home / ".claude-sandbox"
     sandbox_path.mkdir(parents=True, exist_ok=True)
 
+    # Link skills and plugins from ~/.claude to ~/.claude-sandbox
+    link_sandbox_directories(sandbox_path)
+
     port = find_free_port()
     session_token = secrets.token_hex(16)
     base_url = f"http://127.0.0.1:{port}"
@@ -102,15 +164,15 @@ def run_session(exe_path: str, model_override: Optional[str], sandbox_dir: Optio
 
     if not suppress_banner:
         print("\n" + "=" * 70)
-        print(" 🛡️  ИЗОЛИРОВАННАЯ ПЕСОЧНИЦА CLAUDE CODE CLI")
+        print(" 🛡️  CLAUDE CODE CLI ISOLATED SANDBOX")
         print("=" * 70)
-        print(f" [Бинарник CLI]     : {exe_path}")
-        print(f" [Порт прокси]      : {port} (выделен динамически)")
-        print(f" [Веб-дашборд]      : http://127.0.0.1:{port}/dashboard")
-        print(f" [Токен сессии]    : {session_token[:8]}... (защита от посторонних подключений)")
-        print(f" [Папка песочницы]  : {sandbox_path}")
-        print(f" [Модель по умолч.] : {active_model}")
-        print(f" [Изоляция]         : Вторая сессия в системе НЕ затрагивается")
+        print(f" [CLI Binary]       : {exe_path}")
+        print(f" [Proxy Port]       : {port} (dynamically allocated)")
+        print(f" [Web Dashboard]    : http://127.0.0.1:{port}/dashboard")
+        print(f" [Session Token]    : {session_token[:8]}... (secure token auth)")
+        print(f" [Sandbox Dir]      : {sandbox_path}")
+        print(f" [Default Model]    : {active_model}")
+        print(f" [Isolation]        : Other active Claude sessions on host untouched")
         print("=" * 70 + "\n")
 
 
@@ -173,7 +235,17 @@ def run_session(exe_path: str, model_override: Optional[str], sandbox_dir: Optio
     ]
 
     settings_file = sandbox_path / "settings.json"
+    real_settings_file = user_home / ".claude" / "settings.json"
+    inherited_settings = {}
+    if real_settings_file.exists():
+        try:
+            with open(real_settings_file, "r", encoding="utf-8") as f:
+                inherited_settings = json.load(f)
+        except Exception:
+            inherited_settings = {}
+
     sandbox_settings = {
+        **inherited_settings,
         "model": active_model,
         "defaultModel": active_model,
         "modelPicker": {
@@ -181,6 +253,7 @@ def run_session(exe_path: str, model_override: Optional[str], sandbox_dir: Optio
             "options": model_picker_options
         },
         "env": {
+            **(inherited_settings.get("env", {})),
             "ANTHROPIC_BASE_URL": base_url,
             "ANTHROPIC_AUTH_TOKEN": session_token,
             "ANTHROPIC_MODEL": active_model,
@@ -213,22 +286,22 @@ def run_session(exe_path: str, model_override: Optional[str], sandbox_dir: Optio
 
     # 2. Start local proxy in background
     if not suppress_banner:
-        print("[Launcher] Запускаю локальный прокси...")
+        print("[Launcher] Starting local proxy server...")
     start_proxy_thread(port, session_token)
 
     if not wait_for_proxy_health(port):
-        print("✗ Ошибка: Не удалось запустить прокси. Завершение.")
+        print("✗ Error: Failed to start proxy server. Exiting.")
         sys.exit(1)
 
     if open_dashboard:
         import webbrowser
         dash_url = f"http://127.0.0.1:{port}/dashboard"
         if not suppress_banner:
-            print(f"[Launcher] Открываю веб-дашборд в браузере: {dash_url}")
+            print(f"[Launcher] Opening web dashboard in browser: {dash_url}")
         webbrowser.open(dash_url)
 
     if not suppress_banner:
-        print("[Launcher] Прокси готов! Запускаю Claude Code CLI...\n")
+        print("[Launcher] Proxy is ready! Launching Claude Code CLI...\n")
 
     # 3. Build process-isolated environment variables
     proc_env = os.environ.copy()
@@ -259,60 +332,60 @@ def run_session(exe_path: str, model_override: Optional[str], sandbox_dir: Optio
     except KeyboardInterrupt:
         exit_code = 130
     except Exception as e:
-        print(f"[Launcher] Ошибка запуска процесса: {e}")
+        print(f"[Launcher] Process launch error: {e}")
         exit_code = 1
 
     if not suppress_banner:
-        print(f"\n[Launcher] Сеанс CLI завершен (код: {exit_code}). Прокси остановлен.")
+        print(f"\n[Launcher] CLI session ended (code: {exit_code}). Proxy stopped.")
     sys.exit(exit_code)
 
 
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        description="Изолированный лаунчер песочницы для Claude Code CLI"
+        description="Isolated Sandbox Launcher for Claude Code CLI"
     )
     parser.add_argument(
         "mode",
         nargs="?",
         choices=["cli", "desktop", "proxy"],
         default="cli",
-        help="Режим запуска: 'cli' (по умолчанию, Claude Code CLI) или 'proxy' (только прокси-сервер)"
+        help="Run mode: 'cli' (default, Claude Code CLI) or 'proxy' (standalone proxy server)"
     )
     parser.add_argument(
         "--model",
         default=None,
-        help="Модель для принудительного переопределения (по умолчанию используется Default: gemini-3.8-flash-tiered)"
+        help="Model override (default: gemini-3.8-flash-tiered)"
     )
     parser.add_argument(
         "--sandbox-dir",
         default=None,
-        help="Изолированная директория конфигурации (по умолчанию ~/.claude-sandbox)"
+        help="Isolated sandbox config directory (default: ~/.claude-sandbox)"
     )
     parser.add_argument(
         "--exe",
         default=None,
-        help="Пользовательский путь к исполняемому файлу claude.exe"
+        help="Custom path to claude.exe binary"
     )
     parser.add_argument(
         "--dashboard",
         action="store_true",
-        help="Автоматически открыть веб-дашборд в браузере при запуске сессии"
+        help="Automatically open web dashboard in browser upon launch"
     )
     parser.add_argument(
         "-v", "--verbose",
         action="store_true",
-        help="Выводить подробные логи запросов прокси в консоль (по умолчанию выключено для чистоты экрана)"
+        help="Print verbose proxy request logs to console"
     )
     parser.add_argument(
         "-q", "--quiet",
         action="store_true",
-        help="Подавить вывод информационных сообщений лаунчера"
+        help="Suppress launcher banner messages"
     )
     parser.add_argument(
         "extra_args",
         nargs=argparse.REMAINDER,
-        help="Дополнительные аргументы, передаваемые в Claude Code CLI"
+        help="Additional arguments passed to Claude Code CLI"
     )
 
     args = parser.parse_args()
@@ -323,25 +396,25 @@ def main():
         from server import run_server
         set_quiet_mode(args.quiet)
         if not args.quiet:
-            print("[Launcher] Запуск автономного прокси на http://127.0.0.1:8080...")
+            print("[Launcher] Starting standalone proxy on http://127.0.0.1:8080...")
         try:
             asyncio.run(run_server(host="127.0.0.1", port=8080))
         except KeyboardInterrupt:
             if not args.quiet:
-                print("\nПрокси остановлен.")
+                print("\nProxy stopped.")
         return
 
     # 2. Desktop Mode Notice
     if args.mode == "desktop":
-        print("✗ Режим 'desktop' отключен: официальный Claude Desktop не поддерживает кастомный Base URL (захардкожен на claude.ai).")
-        print("  Для работы с прокси используйте Claude Code CLI (python launcher.py) или сторонний GUI (Chatbox, LibreChat).")
+        print("✗ Mode 'desktop' disabled: official Claude Desktop does not support custom Base URL (hardcoded to claude.ai).")
+        print("  Use Claude Code CLI (python launcher.py) or third-party GUI clients (Chatbox, LibreChat).")
         sys.exit(1)
 
     # 3. CLI Mode (Default)
     cli_exe = args.exe or detect_cli_path()
     if not cli_exe:
-        print("✗ Claude Code CLI не найден автоматически.")
-        print("  Укажите путь вручную через флаг: python launcher.py --exe <путь>")
+        print("✗ Claude Code CLI was not automatically detected.")
+        print("  Please specify path manually: python launcher.py --exe <path>")
         sys.exit(1)
 
     run_session(cli_exe, args.model, args.sandbox_dir, args.extra_args, verbose=args.verbose, quiet=args.quiet, open_dashboard=args.dashboard)

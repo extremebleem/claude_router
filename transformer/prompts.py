@@ -156,8 +156,12 @@ def extract_user_system_prompt(raw_system: Optional[Union[str, List[Any]]]) -> s
             if "x-anthropic-billing-header" in text_lower or "cc_version=" in text_lower or "cc_entrypoint=" in text_lower:
                 continue
 
-            # 2. Skip Block 1: "You are Claude Code, Anthropic's official CLI for Claude"
+            # 2. Skip Claude Code / Anthropic identity declarations
             if "you are claude code" in text_lower or "anthropic's official cli" in text_lower:
+                continue
+
+            # 3. Skip Muse Spark identity block if coming from muse-spark-code (handled by base prompt)
+            if "you are muse spark" in text_lower and "visual studio code through the muse spark code extension" in text_lower:
                 continue
 
             clean_block = text.strip()
@@ -205,34 +209,36 @@ def build_system_instruction(
         parts.append({"text": MODEL_SPECIFIC_TUNING["thinking"]})
         if "claude" in m:
             parts.append({"text": MODEL_SPECIFIC_TUNING["claude"]})
+        elif "muse" in m or "spark" in m:
+            parts.append({"text": MODEL_SPECIFIC_TUNING["muse-spark"]})
         elif "pro" in m:
             parts.append({"text": MODEL_SPECIFIC_TUNING["gemini-pro"]})
         else:
             parts.append({"text": MODEL_SPECIFIC_TUNING["gemini-flash"]})
 
-    # 2. Claude models
+    # 2. Muse Spark family
+    elif "muse" in m or "spark" in m:
+        parts.append({"text": MODEL_SPECIFIC_TUNING["muse-spark"]})
+
+    # 3. Claude models
     elif "claude" in m:
         parts.append({"text": MODEL_SPECIFIC_TUNING["claude"]})
 
-    # 3. Lite models
+    # 4. Lite models
     elif "lite" in m or "extra-low" in m:
         parts.append({"text": MODEL_SPECIFIC_TUNING["lite"]})
 
-    # 4. Pro models (Gemini 3.1 Pro, Gemini 2.5 Pro)
+    # 5. Pro models (Gemini 3.1 Pro, Gemini 2.5 Pro)
     elif "pro" in m:
         parts.append({"text": MODEL_SPECIFIC_TUNING["gemini-pro"]})
 
-    # 5. Gemini Flash family (Gemini 3.8 Flash, 3.6 Flash, 3.5 Flash, 3 Flash)
+    # 6. Gemini Flash family (Gemini 3.8 Flash, 3.6 Flash, 3.5 Flash, 3 Flash)
     elif any(k in m for k in ["3.8", "3.6", "3.5", "3.1", "flash", "agent"]):
         parts.append({"text": MODEL_SPECIFIC_TUNING["gemini-flash"]})
 
-    # 6. GPT-OSS family
+    # 7. GPT-OSS family
     elif "gpt" in m:
         parts.append({"text": MODEL_SPECIFIC_TUNING["gpt-oss"]})
-
-    # 7. Muse Spark family
-    elif "muse" in m or "spark" in m:
-        parts.append({"text": MODEL_SPECIFIC_TUNING["muse-spark"]})
 
     # 8. Default fallback: Flash Agentic
     else:

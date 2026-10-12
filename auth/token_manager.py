@@ -182,7 +182,7 @@ class TokenManager:
 
         # Fallback resilience: If all accounts are in cooldown, don't hard-lock the user!
         if all_accounts:
-            log(f"[TokenManager] Все аккаунты в кулдауне. Автоматический сброс кулдауна для повторной попытки.", level="WARN")
+            log(f"[TokenManager] All accounts in cooldown. Automatically resetting cooldowns for retry attempt.", level="WARN")
             self._exhausted_accounts.clear()
             return all_accounts
 
@@ -205,7 +205,7 @@ class TokenManager:
                 self._data["active_email"] = email
                 self._save()
                 return
-        raise ValueError(f"Аккаунт с email '{email}' не найден.")
+        raise ValueError(f"Account with email '{email}' not found.")
 
     def get_active_account(self) -> Optional[Dict[str, Any]]:
         active_email = self._data.get("active_email")
@@ -236,9 +236,9 @@ class TokenManager:
                     self._save()
                     return account["access_token"], account.get("project_id")
                 except Exception as e:
-                    log(f"[TokenManager] Ошибка обновления токена для {account.get('email')}: {e}", level="ERROR")
+                    log(f"[TokenManager] Error refreshing token for {account.get('email')}: {e}", level="ERROR")
             else:
-                log(f"[TokenManager] Токен для {account.get('email')} истек, а refresh_token отсутствует.", level="WARN")
+                log(f"[TokenManager] Token for {account.get('email')} expired, but refresh_token is missing.", level="WARN")
 
         return access_token, account.get("project_id")
 
@@ -256,7 +256,7 @@ class TokenManager:
         # 2. Try detecting from local Antigravity
         local_creds = detect_local_credentials()
         if local_creds:
-            log("[TokenManager] Обнаружена локальная сессия Antigravity!")
+            log("[TokenManager] Detected local Antigravity session!")
             self.add_or_update_account(local_creds)
             return local_creds["access_token"], local_creds.get("project_id")
 

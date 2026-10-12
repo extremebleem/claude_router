@@ -74,7 +74,7 @@ Opens `http://127.0.0.1:<port>/dashboard` directly in your default browser.
 
 ### Non-Interactive / Piped Query
 ```bash
-python launcher.py cli -- -p "Напиши функцию quicksort на Python"
+python launcher.py cli -- -p "Write quicksort function in Python"
 ```
 
 ### Standalone Proxy Mode (Port 8080)

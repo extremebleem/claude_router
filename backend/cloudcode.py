@@ -57,11 +57,11 @@ class CloudCodeClient:
         email = account.get("email", "unknown")
         access_token, project_id = self.token_manager.get_token_for_account(account)
         if not access_token:
-            return None, 401, f"Не удалось получить токен для {email}"
+            return None, 401, f"Failed to acquire token for {email}"
 
         effective_project_id = project_id or DEFAULT_FALLBACK_PROJECT_ID
         if not project_id:
-            log(f"[CloudCode] [{email}] Внимание: GCP project_id не найден, используется fallback '{effective_project_id}'.", level="WARN")
+            log(f"[CloudCode] [{email}] Warning: GCP project_id not found, using fallback '{effective_project_id}'.", level="WARN")
 
         payload = convert_anthropic_to_google(
             anthropic_request,
@@ -93,7 +93,7 @@ class CloudCodeClient:
         for endpoint in CLOUDCODE_ENDPOINTS:
             url = f"{endpoint}/v1internal:streamGenerateContent?alt=sse"
             try:
-                log(f"[CloudCode] [{email}] Отправка запроса {req_id or ''} в {endpoint} (модель: {model})...")
+                log(f"[CloudCode] [{email}] Dispatching request {req_id or ''} to {endpoint} (model: {model})...")
                 resp = await session.post(
                     url,
                     headers=headers,
@@ -102,7 +102,7 @@ class CloudCodeClient:
                 )
 
                 if resp.status == 200:
-                    log(f"[CloudCode] [{email}] ✓ HTTP 200 OK от {endpoint}")
+                    log(f"[CloudCode] [{email}] ✓ HTTP 200 OK from {endpoint}")
                     if req_id and SAVE_DETAILED_REQUEST_LOGS:
                         try:
                             with open(LOGS_DIR / f"req_{req_id}_google_success.json", "w", encoding="utf-8") as f:
@@ -115,13 +115,13 @@ class CloudCodeClient:
                 if resp.status == 401:
                     err_text = await resp.text()
                     resp.close()
-                    log(f"[CloudCode] [{email}] Получен 401 Unauthenticated. Принудительно обновляю токен...", level="WARN")
+                    log(f"[CloudCode] [{email}] Received 401 Unauthenticated. Force refreshing token...", level="WARN")
                     new_token, _ = self.token_manager.get_token_for_account(account, force_refresh=True)
                     if new_token and new_token != access_token:
                         headers["Authorization"] = f"Bearer {new_token}"
                         retry_resp = await session.post(url, headers=headers, json=payload)
                         if retry_resp.status == 200:
-                            log(f"[CloudCode] [{email}] ✓ Повтор после 401 успешен (HTTP 200)")
+                            log(f"[CloudCode] [{email}] ✓ Retry after 401 succeeded (HTTP 200)")
                             return retry_resp, 200, None
                         else:
                             retry_err = await retry_resp.text()
@@ -133,26 +133,26 @@ class CloudCodeClient:
                 if resp.status == 429:
                     err_text = await resp.text()
                     resp.close()
-                    log(f"[CloudCode] [{email}] ✗ HTTP 429 от {endpoint}: {err_text}", level="WARN")
+                    log(f"[CloudCode] [{email}] ✗ HTTP 429 from {endpoint}: {err_text}", level="WARN")
                     return None, 429, err_text
 
                 # 403: Forbidden / Permission Denied
                 if resp.status == 403:
                     err_text = await resp.text()
                     resp.close()
-                    log(f"[CloudCode] [{email}] ✗ HTTP 403 от {endpoint}: {err_text}", level="ERROR")
+                    log(f"[CloudCode] [{email}] ✗ HTTP 403 from {endpoint}: {err_text}", level="ERROR")
                     last_status = 403
                     last_err_text = err_text
                     continue
 
                 err_text = await resp.text()
                 resp.close()
-                log(f"[CloudCode] [{email}] ✗ HTTP {resp.status} от {endpoint}: {err_text}", level="ERROR")
+                log(f"[CloudCode] [{email}] ✗ HTTP {resp.status} from {endpoint}: {err_text}", level="ERROR")
                 last_status = resp.status
                 last_err_text = err_text
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                log(f"[CloudCode] [{email}] Исключение соединения с {endpoint}: {e}", level="WARN")
+                log(f"[CloudCode] [{email}] Connection exception to {endpoint}: {e}", level="WARN")
                 last_err_text = str(e)
                 continue
 
@@ -176,16 +176,16 @@ class CloudCodeClient:
             all_accs = self.token_manager.get_accounts()
             if not all_accs:
                 raise RuntimeError(
-                    "Не найден токен авторизации. Выполните 'python cli_auth.py login' перед запуском."
+                    "No authorization token found. Run 'python cli_auth.py login' before starting."
                 )
             # All accounts are currently in cooldown
             exhausted_info = self.token_manager.get_exhausted_status()
             raise RuntimeError(
-                f"RESOURCE_EXHAUSTED (429): Все доступные аккаунты ({len(all_accs)}) исчерпали квоту для модели {model}. "
-                f"Статус кулдаунов: {exhausted_info}"
+                f"RESOURCE_EXHAUSTED (429): All available accounts ({len(all_accs)}) exhausted quota for model {model}. "
+                f"Cooldown status: {exhausted_info}"
             )
 
-        log(f"[Multi-Account] Доступно аккаунтов в пуле для {model}: {len(available_accounts)}")
+        log(f"[Multi-Account] Accounts available in pool for {model}: {len(available_accounts)}")
 
         last_error_message = None
 
@@ -206,16 +206,16 @@ class CloudCodeClient:
             if status == 429:
                 cooldown = parse_retry_delay_from_error(err_text or "", default_seconds=300.0)
                 self.token_manager.mark_account_exhausted(email, model, cooldown_seconds=cooldown)
-                last_error_message = f"RESOURCE_EXHAUSTED (429) на {email}: {err_text}"
-                log(f"[Multi-Account] Аккаунт {email} исчерпал лимит для {model}. Переключаюсь на следующий аккаунт...", level="WARN")
+                last_error_message = f"RESOURCE_EXHAUSTED (429) on {email}: {err_text}"
+                log(f"[Multi-Account] Account {email} exhausted limit for {model}. Switching to next account...", level="WARN")
                 continue
 
             if status == 401:
                 last_error_message = f"401 Authentication error on {email}: {err_text}"
                 continue
 
-            last_error_message = f"Ошибка HTTP {status} на {email}: {err_text}"
+            last_error_message = f"HTTP {status} error on {email}: {err_text}"
 
         raise RuntimeError(
-            last_error_message or f"RESOURCE_EXHAUSTED (429): Все аккаунты из пула ({len(available_accounts)}) временно исчерпали квоту."
+            last_error_message or f"RESOURCE_EXHAUSTED (429): All accounts in pool ({len(available_accounts)}) temporarily exhausted quota."
         )

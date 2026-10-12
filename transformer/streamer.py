@@ -9,6 +9,7 @@ import uuid
 from typing import AsyncGenerator, Dict, Any, Optional, List
 
 from transformer.signatures import signature_cache
+from transformer.tokenizer import estimate_request_tokens
 from logger import log
 
 
@@ -325,7 +326,7 @@ async def aggregate_sse_stream_to_json(
             try:
                 b["input"] = json.loads(raw_val) if raw_val else {}
             except Exception as e:
-                log(f"[Streamer Warning] Ошибка парсинга JSON аргументов инструмента {b.get('name')}: {e} (raw: {raw_val})", level="WARN")
+                log(f"[Streamer Warning] Error parsing JSON arguments for tool {b.get('name')}: {e} (raw: {raw_val})", level="WARN")
                 b["input"] = {}
             del b["_raw_json"]
 

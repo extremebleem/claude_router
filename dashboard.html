@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -404,11 +404,11 @@
         <div class="header-actions">
             <div class="status-pill">
                 <span class="status-dot"></span>
-                <span>СЕРВЕР АКТИВЕН</span>
+                <span>SERVER ACTIVE</span>
             </div>
             <button class="btn" onclick="fetchData()">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
-                Обновить
+                Refresh
             </button>
         </div>
     </header>
@@ -417,24 +417,24 @@
         <!-- Top Statistics -->
         <section class="stats-grid">
             <div class="stat-card">
-                <span class="stat-label">Всего запросов</span>
+                <span class="stat-label">Total Requests</span>
                 <span class="stat-value" id="stat-total-requests">0</span>
-                <span class="stat-sub">с момента старта сервера</span>
+                <span class="stat-sub">since server startup</span>
             </div>
             <div class="stat-card">
-                <span class="stat-label">��ктивный аккаунт</span>
+                <span class="stat-label">Active Account</span>
                 <span class="stat-value" style="font-size: 1.1rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" id="stat-active-account">-</span>
-                <span class="stat-sub" id="stat-active-tier">План: неизвестен</span>
+                <span class="stat-sub" id="stat-active-tier">Tier: unknown</span>
             </div>
             <div class="stat-card">
-                <span class="stat-label">Пул Google аккаунтов</span>
+                <span class="stat-label">Google Accounts Pool</span>
                 <span class="stat-value" id="stat-total-accounts">0</span>
-                <span class="stat-sub">с авто-переключением на 429</span>
+                <span class="stat-sub">with auto-failover on 429</span>
             </div>
             <div class="stat-card">
                 <span class="stat-label">Gemini Studio Fallback</span>
                 <span class="stat-value" style="font-size: 1.2rem;" id="stat-gemini-fallback">-</span>
-                <span class="stat-sub">резервная линия отказоустойчивости</span>
+                <span class="stat-sub">backup resilience provider</span>
             </div>
         </section>
 
@@ -445,10 +445,10 @@
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
                     Остаток квот моделей (Активный аккаунт)
                 </h2>
-                <span style="font-size: 0.85rem; color: var(--text-dim);" id="quotas-timestamp">Обновлено: -</span>
+                <span style="font-size: 0.85rem; color: var(--text-dim);" id="quotas-timestamp">Updated: -</span>
             </div>
             <div class="quotas-grid" id="quotas-container">
-                <div style="color: var(--text-muted); font-size: 0.9rem;">Загрузка квот...</div>
+                <div style="color: var(--text-muted); font-size: 0.9rem;">Loading quotas...</div>
             </div>
         </section>
 
@@ -457,11 +457,11 @@
             <div class="section-header">
                 <h2 class="section-title">
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
-                    Пул подключенных Google аккаунтов
+                    Connected Google Accounts Pool
                 </h2>
             </div>
             <div class="accounts-grid" id="accounts-container">
-                <div style="color: var(--text-muted); font-size: 0.9rem;">Загрузка аккаунтов...</div>
+                <div style="color: var(--text-muted); font-size: 0.9rem;">Loading accounts...</div>
             </div>
         </section>
 
@@ -470,26 +470,26 @@
             <div class="section-header">
                 <h2 class="section-title">
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-                    Недавние запросы к прокси
+                    Recent Proxy Requests
                 </h2>
             </div>
             <div class="table-container">
                 <table>
                     <thead>
                         <tr>
-                            <th>Время</th>
-                            <th>ID запроса</th>
-                            <th>Модель</th>
-                            <th>Аккаунт</th>
-                            <th>Тип</th>
-                            <th>Статус</th>
-                            <th>Задержка</th>
+                            <th>Time</th>
+                            <th>Request ID</th>
+                            <th>Model</th>
+                            <th>Account</th>
+                            <th>Type</th>
+                            <th>Status</th>
+                            <th>Latency</th>
                         </tr>
                     </thead>
                     <tbody id="requests-tbody">
                         <tr>
                             <td colspan="7" style="text-align: center; color: var(--text-dim); padding: 2rem;">
-                                Запросов пока не зафиксировано
+                                No requests recorded yet
                             </td>
                         </tr>
                     </tbody>
@@ -511,9 +511,9 @@
                     const stats = await statsRes.json();
                     document.getElementById('stat-total-requests').textContent = stats.total_requests || 0;
                     document.getElementById('stat-active-account').textContent = stats.active_account || '-';
-                    document.getElementById('stat-active-tier').textContent = `План: ${(stats.tier || 'free').toUpperCase()}`;
+                    document.getElementById('stat-active-tier').textContent = `Tier: ${(stats.tier || 'free').toUpperCase()}`;
                     document.getElementById('stat-total-accounts').textContent = stats.total_accounts || 1;
-                    document.getElementById('stat-gemini-fallback').textContent = stats.direct_gemini_api ? 'Включен ✓' : 'Не задан ✕';
+                    document.getElementById('stat-gemini-fallback').textContent = stats.direct_gemini_api ? 'Enabled ✓' : 'Not Configured ✕';
                     document.getElementById('stat-gemini-fallback').style.color = stats.direct_gemini_api ? 'var(--accent-green)' : 'var(--text-dim)';
                 }
 
@@ -557,7 +557,7 @@
         function renderAccounts(accounts) {
             const container = document.getElementById('accounts-container');
             if (!accounts.length) {
-                container.innerHTML = '<div style="color: var(--text-dim);">Нет сохраненных аккаунтов.</div>';
+                container.innerHTML = '<div style="color: var(--text-dim);">No stored accounts.</div>';
                 return;
             }
 
@@ -567,7 +567,7 @@
                 const hasCooldown = cooldowns.length > 0;
                 const safeEmail = escapeHtml(acc.email);
                 const safeTier = escapeHtml(acc.tier);
-                const safeProj = acc.project_id ? 'GCP: ' + escapeHtml(acc.project_id) : 'Локальная сессия';
+                const safeProj = acc.project_id ? 'GCP: ' + escapeHtml(acc.project_id) : 'Local session';
 
                 return `
                     <div class="account-card ${isActive ? 'active' : ''}">
@@ -583,17 +583,17 @@
 
                         ${hasCooldown ? `
                             <div class="account-cooldown">
-                                ⚠️ 429 Кулдаун: ${cooldowns.map(([m, s]) => `${escapeHtml(m)} (${Math.round(s)}с)`).join(', ')}
+                                ⚠️ 429 Cooldown: ${cooldowns.map(([m, s]) => `${escapeHtml(m)} (${Math.round(s)}с)`).join(', ')}
                             </div>
                         ` : ''}
 
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-top: auto;">
                             <span style="font-size: 0.8rem; color: ${isActive ? 'var(--accent-green)' : 'var(--text-dim)'}; font-weight: 600;">
-                                ${isActive ? '● АКТИВЕН' : 'Готов к работе'}
+                                ${isActive ? '● ACTIVE' : 'Ready'}
                             </span>
                             ${!isActive ? `
                                 <button class="btn btn-switch" style="padding: 0.35rem 0.75rem; font-size: 0.8rem;" data-email="${safeEmail}">
-                                    Активировать
+                                    Activate
                                 </button>
                             ` : ''}
                         </div>
@@ -624,7 +624,7 @@
                     await fetchData();
                 } else {
                     const err = await res.json().catch(() => ({}));
-                    alert('Ошибка переключения аккаунта: ' + (err.message || res.statusText));
+                    alert('Error switching account: ' + (err.message || res.statusText));
                 }
             } catch (e) {
                 console.error(e);
@@ -635,11 +635,11 @@
             const container = document.getElementById('quotas-container');
             const accounts = data.accounts || [];
             if (!accounts.length) {
-                container.innerHTML = '<div style="color: var(--text-dim);">Квоты не загружены.</div>';
+                container.innerHTML = '<div style="color: var(--text-dim);">Quotas not loaded.</div>';
                 return;
             }
 
-            document.getElementById('quotas-timestamp').textContent = `Обновлено: ${escapeHtml(data.timestamp || 'только что')}`;
+            document.getElementById('quotas-timestamp').textContent = `Updated: ${escapeHtml(data.timestamp || 'just now')}`;
 
             // Find active account or first
             const activeAcc = accounts[0];
@@ -647,7 +647,7 @@
             const keys = Object.keys(limits);
 
             if (!keys.length) {
-                container.innerHTML = '<div style="color: var(--text-dim);">Нет доступных квот для отображения.</div>';
+                container.innerHTML = '<div style="color: var(--text-dim);">No available quotas to display.</div>';
                 return;
             }
 
@@ -672,8 +672,8 @@
                             <div class="progress-bar-fill" style="width: ${percent}%; background-color: ${color};"></div>
                         </div>
                         <div class="quota-footer">
-                            <span>Остаток: ${percent}%</span>
-                            <span>Сброс: ${safeReset}</span>
+                            <span>Remaining: ${percent}%</span>
+                            <span>Reset: ${safeReset}</span>
                         </div>
                     </div>
                 `;
@@ -686,7 +686,7 @@
                 tbody.innerHTML = `
                     <tr>
                         <td colspan="7" style="text-align: center; color: var(--text-dim); padding: 2rem;">
-                            Запросов пока не зафиксировано
+                            No requests recorded yet
                         </td>
                     </tr>
                 `;

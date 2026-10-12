@@ -44,8 +44,8 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
                 html = """
                 <html>
                 <body style="font-family: system-ui, sans-serif; text-align: center; padding: 50px; background: #0f172a; color: #f8fafc;">
-                    <h2 style="color: #38bdf8;">✓ Авторизация успешна!</h2>
-                    <p>Токен получен. Вы можете закрыть эту вкладку и вернуться в терминал.</p>
+                    <h2 style="color: #38bdf8;">✓ Authorization Successful!</h2>
+                    <p>Token acquired. You may now close this tab and return to the terminal.</p>
                 </body>
                 </html>
                 """
@@ -55,7 +55,7 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
                 self.send_response(400)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.end_headers()
-                self.wfile.write(f"<h2>Ошибка авторизации: {self.server.error}</h2>".encode("utf-8"))
+                self.wfile.write(f"<h2>Authorization Error: {self.server.error}</h2>".encode("utf-8"))
         else:
             self.send_response(404)
             self.end_headers()
@@ -77,7 +77,7 @@ def find_free_callback_port() -> Tuple[int, str]:
                 return port, f"http://localhost:{port}/oauth-callback"
             except OSError:
                 continue
-    raise RuntimeError("Не удалось занять локальный порт для OAuth callback (все порты заняты).")
+    raise RuntimeError("Failed to bind local port for OAuth callback (all candidate ports busy).")
 
 
 def build_authorization_url(redirect_uri: str, state: str = "antigravity_auth") -> str:
@@ -154,15 +154,15 @@ def login_flow_browser(timeout: int = 120) -> Dict[str, Any]:
     server = OAuthServer(port)
     server.timeout = 2.0  # Periodic timeout to allow graceful exit
 
-    print(f"\n[OAuth] Открываю браузер для входа в Google...")
-    print(f"[OAuth] Если страница не открылась автоматически, перейдите по ссылке:\n{auth_url}\n")
+    print(f"\n[OAuth] Opening browser for Google login...")
+    print(f"[OAuth] If page does not open automatically, visit this URL:\n{auth_url}\n")
     webbrowser.open(auth_url)
 
     start_time = time.time()
     while not server.auth_code and not server.error:
         if time.time() - start_time > timeout:
             server.server_close()
-            raise TimeoutError("Таймаут ожидания авторизации в браузере.")
+            raise TimeoutError("Timed out waiting for browser authorization.")
         server.handle_request()
 
     code = server.auth_code
@@ -170,11 +170,11 @@ def login_flow_browser(timeout: int = 120) -> Dict[str, Any]:
     server.server_close()
 
     if error:
-        raise RuntimeError(f"Ошибка при получении кода авторизации: {error}")
+        raise RuntimeError(f"Error receiving authorization code: {error}")
     if not code:
-        raise RuntimeError("Код авторизации не был получен.")
+        raise RuntimeError("Authorization code was not received.")
 
-    print("[OAuth] Код получен! Обмениваю на токен доступа...")
+    print("[OAuth] Code received! Exchanging for access token...")
     tokens = exchange_code_for_tokens(code, redirect_uri)
     user_info = fetch_user_info(tokens["access_token"])
 
