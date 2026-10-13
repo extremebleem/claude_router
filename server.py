@@ -31,6 +31,8 @@ from config import DEFAULT_FALLBACK_PROJECT_ID, SAVE_DETAILED_REQUEST_LOGS
 from auth.token_manager import TokenManager
 from auth.discovery import fetch_available_models
 from backend.antigravity import AntigravityClient, CloudCodeClient
+from backend.opencode import OpenCodeClient
+from backend.router import ProviderRouter, OPENCODE_MODELS
 from backend.gemini_api import GeminiApiClient
 from transformer.signatures import signature_cache
 from transformer.streamer import parse_google_sse_stream, aggregate_sse_stream_to_json
@@ -253,7 +255,10 @@ class ProxyApp:
     def __init__(self, token_manager: TokenManager, session_auth_token: Optional[str] = None):
         self.token_manager = token_manager
         self.session_auth_token = session_auth_token
-        self.cloudcode_client = CloudCodeClient(token_manager)
+        self.antigravity_client = AntigravityClient(token_manager)
+        self.cloudcode_client = self.antigravity_client
+        self.opencode_client = OpenCodeClient(token_manager)
+        self.router = ProviderRouter(self.antigravity_client, self.opencode_client)
         self.http_session: Optional[ClientSession] = None
         self._models_cache = None
         self._models_cache_time = 0
@@ -614,10 +619,16 @@ class ProxyApp:
 
     async def get_backend_stream(self, body: dict, req_id: Optional[str] = None):
         """
-        Dispatches request to Antigravity Cloud Code with multi-account failover.
-        If all accounts are exhausted (429) or Cloud Code fails, and a Gemini API key is configured,
-        automatically falls back to Google AI Studio Gemini API.
+        Dispatches request via ProviderRouter to Antigravity (Google CloudCode) or OpenCode Zen.
+        If Antigravity is exhausted and Gemini API key is configured, falls back to Google AI Studio.
         """
+        model_name = body.get("model", "")
+        provider = self.router.resolve_provider(model_name)
+
+        if provider == "opencode":
+            log(f"[Req #{req_id}] Routing model '{model_name}' to OpenCode Zen backend", level="INFO")
+            return self.opencode_client.generate_stream(body)
+
         gemini_key = self.token_manager.get_gemini_api_key()
 
         try:
@@ -869,6 +880,19 @@ class ProxyApp:
                     })
 
                 if results:
+                    # Append OpenCode Zen models to dynamic model list
+                    for oc_model in OPENCODE_MODELS:
+                        if not any(m["id"] == oc_model for m in results):
+                            results.append({
+                                "id": oc_model,
+                                "type": "model",
+                                "display_name": f"OpenCode {oc_model}",
+                                "created_at": iso_time,
+                                "object": "model",
+                                "created": int(now),
+                                "owned_by": "opencode",
+                                "description": f"OpenCode {oc_model} (Zen Gateway)",
+                            })
                     self._models_cache = results
                     self._models_cache_time = now
                     return results
