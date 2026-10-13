@@ -1,6 +1,6 @@
 # Claude-Gemini Proxy & Claude Code Sandbox Launcher
 
-A high-performance asynchronous proxy server built with **Python (`aiohttp`)** that bridges requests from **Claude Code** to the **Google Antigravity Cloud Code** and **Google AI Studio (Gemini)** backends.
+A high-performance asynchronous proxy server built with **Python (`aiohttp`)** that bridges requests from **Claude Code** to the **Google Antigravity Cloud Code** and **Google AI Studio (Gemini)** backends, and — for the models it exposes — to the **OpenCode Zen** gateway.
 
 Enables running the **Claude Code CLI** in a fully isolated sandbox, while also providing an Anthropic-compatible API endpoint for third-party GUI clients (Chatbox, LibreChat, Cline).
 
@@ -29,6 +29,12 @@ Enables running the **Claude Code CLI** in a fully isolated sandbox, while also 
    * Google OAuth 2.0 (Antigravity client) with a built-in local callback server.
    * Automatic token refreshing via `refresh_token`.
    * Support for direct Gemini API keys (`AIzaSy...`).
+
+5. **Second Provider: OpenCode Zen**:
+   * Model ids starting with `opencode/` (plus `space-bunny-free`) are routed to `https://opencode.ai/inference/v1` instead of Cloud Code.
+   * Sign in with the Console device flow: `python cli_auth.py login --provider opencode`. API keys work too.
+   * Requests are translated to Zen's OpenAI-compatible shape, matching what the opencode app itself sends.
+   * Zen accounts live in the same pool as Google accounts but keep their own active pointer, so switching one never disturbs the other.
 
 ---
 

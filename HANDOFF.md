@@ -8,33 +8,43 @@
 ## 2. Project Architecture & File Structure
 
 ```
-C:\AI\ClaudeGemini\
+claude-gemini-proxy\
 ├── launcher.py               # Isolated sandbox launcher for Claude Code CLI (ephemeral port, token isolation)
-├── sandbox_launcher.py       # Legacy standalone launcher
 ├── server.py                 # Core aiohttp server implementing /v1/messages, /v1/models, /limits, /health
 ├── logger.py                 # Centralized quiet logger; writes to logs/proxy.log without polluting stdout
-├── config.py                 # Headers, endpoints, and default fallback configurations
-├── cli_auth.py               # CLI tool to view quotas and manage Google accounts
+├── config.py                 # Headers, endpoints (Antigravity + OpenCode Zen), debug switches
+├── cli_auth.py               # CLI tool: quotas, account pool, Google and OpenCode logins
 │
 ├── auth/
-│   ├── token_manager.py      # Extracts tokens from Antigravity SQLite DB & gcloud, handles auto-refresh
-│   ├── oauth.py              # Interactive OAuth login flow for adding multiple Google accounts
-│   └── discovery.py          # Fetches available models and quota metadata from Cloud Code
+│   ├── token_manager.py      # Multi-provider account pool, per-provider active account, refresh, cooldowns
+│   ├── oauth.py              # Interactive Google OAuth login flow
+│   ├── opencode_oauth.py     # OpenCode Console device-code login and token refresh
+│   ├── discovery.py          # Fetches available models and quota metadata from Cloud Code
+│   └── local_detector.py     # Picks up a local Antigravity session when nothing is stored
 │
 ├── backend/
-│   ├── cloudcode.py          # Cloud Code daily API client (session hashing, multi-turn request dispatch)
+│   ├── antigravity.py        # Cloud Code client (session hashing, multi-account 429 failover)
+│   ├── opencode.py           # OpenCode Zen client (Anthropic <-> OpenAI-chat translation, account failover)
+│   ├── router.py             # ProviderRouter: maps a model id to antigravity or opencode
 │   └── gemini_api.py         # Google AI Studio Gemini API client fallback
 │
 ├── transformer/
-│   ├── anthropic_to_google.py # Protobuf schema sanitizer (Phases 1-7) & message converter
-│   ├── signatures.py         # Thinking block cryptographic dummy signature generator & cache
-│   └── streamer.py           # Real-time SSE streaming converter (Google SSE -> Anthropic SSE)
+│   ├── content.py            # Anthropic -> Google request conversion (messages, roles, merging)
+│   ├── schema.py             # Protobuf schema sanitizer for Cloud Code's strict validation
+│   ├── prompts.py            # Antigravity system-prompt construction and identity scrubbing
+│   ├── opencode_prompts.py   # opencode system-prompt selection/rendering per model
+│   ├── signatures.py         # Thought-signature / tool-name / tool-args caches
+│   ├── streamer.py           # Google SSE <-> Anthropic SSE streaming conversion
+│   ├── search.py             # Web search fallback + Google search grounding formatting
+│   ├── tokenizer.py          # BPE token estimation for /v1/messages/count_tokens
+│   └── embeddings.py         # Embeddings handling
+│
+├── prompts/                  # System prompt templates (see prompts/README.md)
+│   └── opencode/             # System prompts ported from the opencode app
 │
 ├── logs/                     # Detailed request logs (req_*.json) and proxy.log
+├── dashboard.html            # Local web dashboard
 └── tests/
-    ├── test_transformer.py  # 15 Unit tests for schema sanitization, turn merging, and streaming
-    ├── test_server.py       # 9 Integration tests for proxy HTTP endpoints
-    └── test_multi_account.py# 6 Tests for multi-account pool, cooldowns, and 429 failover
 ```
 
 ---
@@ -110,13 +120,45 @@ Or while proxy is running:
 | `gemini-2.5-pro` | `gemini-2.5-pro` | `opus` | Gemini 2.5 Pro reasoning |
 | `gemini-2.5-flash` | `gemini-2.5-flash` | `haiku` | Gemini 2.5 Flash |
 
+### OpenCode Zen models (second provider)
+
+Routed to Zen instead of Cloud Code by `backend/router.py`. Advertised ids carry an `opencode/`
+prefix because that is what the client sends; Zen only ever receives the bare id.
+
+| Model ID in Proxy | Zen model id | Description |
+|---|---|---|
+| `space-bunny-free` | `space-bunny-free` | Default Zen model; the only one addressable without a prefix |
+| `opencode/big-pickle` | `big-pickle` | Zen |
+| `opencode/ling-3.0-flash-fin-free` | `ling-3.0-flash-fin-free` | Zen |
+| `opencode/mimo-v2.5-free` | `mimo-v2.5-free` | Zen |
+| `opencode/nemotron-3-ultra-free` | `nemotron-3-ultra-free` | Zen |
+| `opencode/nemotron-3.5-lightning-free` | `nemotron-3.5-lightning-free` | Zen |
+| `opencode/union-alpha` | `union-alpha` | Zen |
+
+Authentication is a Console device-code login (`python cli_auth.py login --provider opencode`),
+stored in the same `accounts.json` pool as the Google accounts but under a separate active pointer,
+so switching providers never disturbs the other.
+
+**Translation notes** (all mirrored from `anomalyco/opencode`, `packages/ai/src/protocols/openai-chat.ts`):
+- Only `messages[0]` may carry `role: "system"`. Claude Code interleaves system turns *between*
+  every model turn; those become `<system-update>` user messages with XML-escaped text, merged into
+  the preceding user turn when there is one. A bare mid-array `system` role is invalid for Chat
+  Completions and also breaks prefix caching.
+- Claude Code's own context-budget bookkeeping (`<total_tokens>…</total_tokens>`) is dropped:
+  it carries no instruction and would inject hundreds of noise messages. Real system updates
+  (`<system-reminder>`, `# Environment`) are kept, with the bookkeeping stripped from them.
+  Toggle via `DROP_TOKEN_ACCOUNTING` in `backend/opencode.py`.
+- Tools are sent with `strict: false`, `max_tokens` becomes `max_completion_tokens`,
+  `stream_options.include_usage` is always on, and `output_config.effort` becomes `reasoning_effort`.
+- `tool_result.is_error` has no equivalent field in Chat Completions, so it is marked in the text.
+
 ---
 
 ## 5. Critical Technical Problems Solved
 
 1. **429 / 400 Bad Request from Cloud Code API:**
    - **Root Cause:** Cloud Code strictly validates JSON Schema against Google Protobuf definitions. Standard JSON schemas from Claude Code contain fields like `type: ["string", "null"]`, `oneOf`, `anyOf`, `title`, or empty object declarations `properties: {}`.
-   - **Resolution:** Implemented recursive 7-phase schema sanitizer in [`transformer/anthropic_to_google.py`](file:///C:/AI/ClaudeGemini/transformer/anthropic_to_google.py):
+   - **Resolution:** Implemented recursive 7-phase schema sanitizer in `transformer/schema.py`, wired through `transformer/content.py`:
      - Normalized union types (`["string", "null"]` -> `string`).
      - Pruned non-protobuf keywords (`title`, `default`, `oneOf`, `anyOf`, `$schema`).
      - Added fallback properties for empty schemas.
@@ -158,13 +200,25 @@ Or while proxy is running:
 
 ---
 
+8. **OpenCode Zen Emulation Fidelity:**
+   - **Mid-conversation `system` turns:** Claude Code injects `role: "system"` messages between every model turn (295 of them in a 884-message session, mostly `<total_tokens>` bookkeeping). Chat Completions only allows `system` at index 0, so they are lowered to `<system-update>` user messages with XML escaping, matching opencode's own `lowerMessages`. Buffering keeps them from splitting an assistant `tool_calls` turn from its `tool` replies.
+   - **Provider prefix:** the `opencode/` namespace is stripped before the request leaves the proxy; Zen only knows bare model ids.
+   - **Error mapping:** upstream HTTP status is mapped to the matching Anthropic error type, so a 400/401/403 from Zen no longer reaches the client disguised as a 500. Streaming errors are detected before the response head is committed, so the HTTP status is real rather than a blanket 200.
+   - **Account failover:** OpenCode accounts share the same pool/cooldown machinery as Google accounts and rotate on 429 or a rejected credential. Cooldowns are stored per model, so one throttled model does not mute the rest of the pool, and an entirely cooling pool answers with `rate_limit_error` (429) rather than a misleading auth error.
+   - **Block lifecycle:** every Anthropic `content_block_start` is emitted exactly once per index, carrying the block's real type. A tool call used to be preceded by a placeholder `text` start on the same index — malformed, and invisible to the tests because folding overwrites the first start with the second.
+   - **Token-bookkeeping shapes:** `<total_tokens>` is recognized with and without the `token(s)` word and `left`/`remaining`, otherwise every bookkeeping turn turns back into a `<system-update>` noise message. A tag quoted inside a real instruction is kept, because the body may not contain sentence punctuation and stripping is line-anchored.
+   - **Output cap:** Claude Code always asks for `max_tokens: 32000`, while free Zen models cap far below it and answer 400. A 400 that names the cap is retried once without `max_completion_tokens`; an unrelated 400 (unknown tool, bad schema) is surfaced unchanged and never retried.
+   - **Catalogue availability:** `/v1/models` appends the static Zen catalogue on every path, including when Google discovery fails — a Zen-only account has no Google token, and would otherwise be offered no models at all.
+
+---
+
 ## 6. Verification Status & Test Suite
 
-All 29 unit & integration tests pass:
+All unit & integration tests pass:
 ```bash
-python -m unittest discover tests
+python -m unittest discover -s tests
 ```
-- `tests/test_transformer.py` (13 tests): verifies protobuf schema sanitization, turn merging, multimodal data, system prompt injection, tool name caching, BPE tokenizer, and stable session ID caching.
+- `tests/test_opencode_client.py`: payload translation, provider-prefix stripping, system-turn lowering and token-bookkeeping filtering, tool adjacency, `is_error`, `strict`, `reasoning_effort`, truncated tool JSON, thinking blocks, one-`content_block_start`-per-index, output-cap retry, error mapping, account failover, and session ownership.
 - `tests/test_server.py` (10 tests): verifies health, models resolution, auto-mode classifier stub, accounts REST endpoints, count_tokens, and web dashboard endpoints (/dashboard, /api/stats, /api/events).
 - `tests/test_multi_account.py` (6 tests): verifies multi-account pool, active switching, removal, model cooldown tracking, round-robin rotation, and automated 429 failover.
 
@@ -206,4 +260,13 @@ python -m unittest discover tests
 ### Milestone 5: Accurate Token Counter Endpoint (Completed ✓)
 - [x] Реализован калиброванный BPE-токенизатор `transformer/tokenizer.py` с поддержкой текстовых блоков, framing-оверхеда, схем инструментов и многобайтовых UTF-8 символов (кириллица, CJK).
 - [x] Точный отклик `/v1/messages/count_tokens` для корректного отображения команды `/context` в Claude Code CLI.
+
+---
+
+### Milestone 6: OpenCode Zen Backend (Completed ✓)
+- [x] Console device-code login (`auth/opencode_oauth.py`) with access-token refresh, stored in the shared pool under its own active pointer.
+- [x] `OpenCodeClient` translating Anthropic Messages to Zen's OpenAI-compatible Chat Completions and back, including tool calls, thinking blocks and usage.
+- [x] `ProviderRouter` dispatching by model id; Zen models listed by `/v1/models`.
+- [x] Per-model account rotation on 429 and on rejected credentials; an all-cooling pool returns 429.
+- [x] Upstream-faithful request shape: bare model id, `<system-update>` lowering of mid-conversation system turns, `strict: false` tools, `max_completion_tokens`, `stream_options`, `reasoning_effort`, and the `x-opencode-*` session headers.
 
