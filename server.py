@@ -30,7 +30,7 @@ from datetime import datetime
 from config import DEFAULT_FALLBACK_PROJECT_ID, SAVE_DETAILED_REQUEST_LOGS
 from auth.token_manager import TokenManager
 from auth.discovery import fetch_available_models
-from backend.cloudcode import CloudCodeClient
+from backend.antigravity import AntigravityClient, CloudCodeClient
 from backend.gemini_api import GeminiApiClient
 from transformer.signatures import signature_cache
 from transformer.streamer import parse_google_sse_stream, aggregate_sse_stream_to_json

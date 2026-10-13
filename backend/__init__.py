@@ -1,4 +1,4 @@
-from backend.cloudcode import CloudCodeClient
+from backend.antigravity import AntigravityClient, CloudCodeClient
 from backend.gemini_api import GeminiApiClient
 
-__all__ = ["CloudCodeClient", "GeminiApiClient"]
+__all__ = ["AntigravityClient", "CloudCodeClient", "GeminiApiClient"]
