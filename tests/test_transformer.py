@@ -568,7 +568,7 @@ class TestClassifierStub(unittest.TestCase):
         self.assertIn("Antigravity", cleaned)
 
         # 5. Auto mode native tools policy injected
-        self.assertIn("Mandatory Native File Tools", cleaned)
+        self.assertIn("Autonomous Execution Policy", cleaned)
         self.assertIn("Read", cleaned)
         self.assertIn("Edit", cleaned)
         self.assertIn("Write", cleaned)

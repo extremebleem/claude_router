@@ -107,13 +107,12 @@ MODEL_SPECIFIC_TUNING: Dict[str, str] = {
 
 # Identities or terms that trigger false 429/blocked responses in Cloud Code
 IDENTITY_SCRUBS = [
-    ("Nous Research", "the assistant team"),
-    ("Hermes Agent", "the assistant"),
-    ("Hermes", "the assistant"),
-    ("Meta Superintelligence Labs", "the assistant team"),
-    ("Claude Code", "Antigravity"),
-    ("Anthropic's official CLI for Claude", "Google Antigravity Coding Assistant"),
-    ("Anthropic", "Google DeepMind"),
+    (r"\bNous Research\b", "the assistant team"),
+    (r"\bHermes Agent\b", "the assistant"),
+    (r"\bHermes\b", "the assistant"),
+    (r"\bClaude Code\b", "Antigravity"),
+    (r"Anthropic's official CLI for Claude", "Google Antigravity Coding Assistant"),
+    (r"\bAnthropic\b", "Google DeepMind"),
 ]
 
 
@@ -126,8 +125,8 @@ def sanitize_user_system_text(text: str) -> str:
     cleaned = re.sub(r"x-anthropic-billing-header[^\n]*\n?", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"cc_version=[^\n;]*;?", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"cc_entrypoint=[^\n;]*;?", "", cleaned, flags=re.IGNORECASE)
-    for term, replacement in IDENTITY_SCRUBS:
-        cleaned = cleaned.replace(term, replacement)
+    for pattern, replacement in IDENTITY_SCRUBS:
+        cleaned = re.sub(pattern, replacement, cleaned)
     return cleaned.strip()
 
 
@@ -175,16 +174,18 @@ def extract_user_system_prompt(raw_system: Optional[Union[str, List[Any]]]) -> s
 
     # 3. Replace Environment section if present with updated Antigravity environment
     env_content = load_prompt_file("environment.md")
-    if env_content and "# Environment" in combined:
-        env_pattern = r"# Environment\s*\n.*?(?=\n# |\Z)"
-        combined = re.sub(env_pattern, env_content + "\n", combined, flags=re.DOTALL)
+    if env_content:
+        # Match "# Environment", "# Environment Context", or "<environment>"
+        env_pattern = r"(?:# Environment[^\n]*|<environment>)\s*\n.*?(?=\n# |\n</environment>|\Z)"
+        if re.search(env_pattern, combined, flags=re.DOTALL):
+            combined = re.sub(env_pattern, env_content + "\n", combined, flags=re.DOTALL)
 
-    # 4. In auto mode / background session: inject mandatory native Read/Edit/Write policy
+    # 4. In auto mode / background session: inject autonomous policy only when session is in auto/background mode
     auto_mode_content = load_prompt_file("auto_mode.md")
     if auto_mode_content:
         if "# Background Session" in combined:
             combined = combined.replace("# Background Session", f"# Background Session\n\n{auto_mode_content}\n")
-        else:
+        elif "permissionmode: auto" in combined.lower() or "auto mode" in combined.lower():
             combined = f"{combined}\n\n{auto_mode_content}"
 
     return sanitize_user_system_text(combined)
@@ -246,9 +247,12 @@ def build_system_instruction(
     elif "gpt" in m:
         parts.append({"text": MODEL_SPECIFIC_TUNING["gpt-oss"]})
 
-    # 8. Default fallback: Flash Agentic
+    # 8. Default fallback based on model capability
     else:
-        parts.append({"text": MODEL_SPECIFIC_TUNING["gemini-flash"]})
+        if "pro" in m or "opus" in m or "high" in m:
+            parts.append({"text": MODEL_SPECIFIC_TUNING["gemini-pro"]})
+        else:
+            parts.append({"text": MODEL_SPECIFIC_TUNING["gemini-flash"]})
 
     # Safely append client user system prompt if provided
     client_prompt = extract_user_system_prompt(user_system)
