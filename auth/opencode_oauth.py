@@ -19,7 +19,9 @@ DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 # the Console reads it to identify the client. Both are build-time defines upstream,
 # so they are overridable here instead of hardcoded.
 OPENCODE_CHANNEL = os.environ.get("OPENCODE_CHANNEL", "stable")
-OPENCODE_VERSION = os.environ.get("OPENCODE_CLIENT_VERSION", "2.0.28")
+# Mirrors the version the local opencode CLI reports. The gateway does not gate on it (verified
+# against 1.19.0 and a nonsense value), but a UA that contradicts the installed client is noise.
+OPENCODE_VERSION = os.environ.get("OPENCODE_CLIENT_VERSION", "1.19.0")
 OPENCODE_USER_AGENT = f"opencode/{OPENCODE_CHANNEL}/{OPENCODE_VERSION}/{OPENCODE_CLIENT_NAME}"
 HEADERS = {"Accept": "application/json", "User-Agent": OPENCODE_USER_AGENT}
 
