@@ -5,6 +5,7 @@ Usage:
     python cli_auth.py login           - Interactive Google OAuth login via browser
     python cli_auth.py login --provider opencode - OpenCode Console device login
     python cli_auth.py add             - Alias for login (add another Google account)
+    python cli_auth.py proxy add <url> - Add an outbound proxy for OpenCode Zen (list / remove too)
     python cli_auth.py status          - Show active account status and token validity
     python cli_auth.py list            - List all stored accounts
     python cli_auth.py pool            - Detailed view of all accounts, quotas and cooldowns
@@ -74,16 +75,20 @@ def opencode_account_rows(manager: TokenManager):
 
 def print_opencode_section(manager: TokenManager):
     print("\n=== OpenCode Zen ===")
+    print(f"Outbound proxies: {len(manager.get_proxies())} (direct connection always included)")
     rows = list(opencode_account_rows(manager))
     if not rows:
-        print("✗ No OpenCode accounts. To log in: python cli_auth.py login --provider opencode")
+        print("ℹ No OpenCode account: the free models are served anonymously as the opencode client "
+              "does. A key is only needed for paid models:")
+        print("  python cli_auth.py login --provider opencode --api-key <KEY>")
+        print(f"Models: {', '.join(opencode_model_ids(free_only=True))}")
         return
     print(f"Models: {', '.join(opencode_model_ids())}")
     for i, (ident, is_active, kind, expiry, cooldown) in enumerate(rows, 1):
         print(f"{i}. {ident}{' [ACTIVE]' if is_active else ''}")
         print(f"   Auth: {kind} | {expiry}" + (f" | ⚠️ Cooldown ({cooldown})" if cooldown else ""))
-    # Worth saying up front: Zen serves its free models to the official client, and a Console
-    # session token is not that credential - the 403 otherwise arrives mid-conversation.
+    # Worth saying up front: Zen's anonymous free tier is served under the literal token "public",
+    # which a Console session token is not - the 403 otherwise arrives mid-conversation.
     if any(kind == "Console login" for _, _, kind, _, _ in rows):
         print("ℹ Free-tier models need a Console API key: "
               "python cli_auth.py login --provider opencode --api-key <KEY>")
@@ -246,6 +251,28 @@ def cmd_quotas(manager: TokenManager):
     print("-" * 65)
 
 
+def cmd_proxy(manager: TokenManager, action: str, url: str = None):
+    """Outbound proxies for OpenCode Zen: a turn moves to the next one when an IP is rate limited."""
+    from backend.proxy_pool import validate_proxy_url, mask_proxy
+    if action == "list":
+        proxies = manager.get_proxies()
+        print(f"=== Outbound Proxies ({len(proxies)}) ===")
+        print("0. direct connection (always part of the rotation)")
+        for i, p in enumerate(proxies, 1):
+            print(f"{i}. {mask_proxy(p)}")
+        return
+    try:
+        url = validate_proxy_url(url)
+    except ValueError as e:
+        print(f"✗ Invalid proxy URL: {e}")
+        sys.exit(1)
+    if action == "add":
+        print(f"✓ Proxy added: {mask_proxy(url)}" if manager.add_proxy(url) else f"ℹ Proxy already stored: {mask_proxy(url)}")
+        print("  Restart the proxy server for a running instance to pick it up.")
+    else:
+        print(f"✓ Proxy removed: {mask_proxy(url)}" if manager.remove_proxy(url) else f"✗ Proxy not found: {mask_proxy(url)}")
+
+
 def cmd_set_key(manager: TokenManager, key: str):
     manager.set_gemini_api_key(key)
     print(f"✓ Direct Gemini API key successfully saved ({key[:8]}...)")
@@ -319,6 +346,10 @@ def main():
     p_check.add_argument("--model", help="Model to probe (default: the first free one Zen advertises)")
 
     subparsers.add_parser("login-opencode", help="Login to OpenCode via device flow")
+    p_proxy = subparsers.add_parser("proxy", help="Manage outbound proxies for OpenCode Zen (http/https/socks5)")
+    p_proxy.add_argument("action", choices=["add", "remove", "list"])
+    p_proxy.add_argument("url", nargs="?", help="e.g. socks5://user:pass@host:port")
+
     subparsers.add_parser("status", help="Check active session status")
     subparsers.add_parser("list", help="List stored accounts")
     subparsers.add_parser("pool", help="Show accounts pool status, cooldowns, and quotas")
@@ -354,6 +385,10 @@ def main():
         import asyncio
         from auth.opencode_oauth import login_opencode_flow
         asyncio.run(login_opencode_flow(manager))
+    elif args.command == "proxy":
+        if args.action != "list" and not args.url:
+            parser.error("proxy add/remove needs a URL")
+        cmd_proxy(manager, args.action, args.url)
     elif args.command == "status":
         cmd_status(manager)
     elif args.command == "list":

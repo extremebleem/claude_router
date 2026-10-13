@@ -54,6 +54,26 @@ class TokenManager:
     def get_gemini_api_key(self) -> Optional[str]:
         return self._data.get("gemini_api_key")
 
+    def get_proxies(self) -> List[str]:
+        """Outbound proxy URLs (see backend/proxy_pool.py), in the order they were added."""
+        return list(self._data.get("proxies", []))
+
+    def add_proxy(self, url: str) -> bool:
+        proxies = self._data.setdefault("proxies", [])
+        if url in proxies:
+            return False
+        proxies.append(url)
+        self._save()
+        return True
+
+    def remove_proxy(self, url: str) -> bool:
+        proxies = self._data.get("proxies", [])
+        if url not in proxies:
+            return False
+        proxies.remove(url)
+        self._save()
+        return True
+
     def add_or_update_account(self, account: Dict[str, Any]):
         """Adds or updates an account entry in the accounts store."""
         email = account.get("email") or account.get("id")

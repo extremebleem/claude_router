@@ -9,20 +9,24 @@ import webbrowser
 from typing import Dict, Any, Optional
 import aiohttp
 
-from config import OPENCODE_CLIENT_NAME, OPENCODE_PROBE_MODEL, OPENCODE_ZEN_BASE_URL
+from config import OPENCODE_PROBE_MODEL, OPENCODE_ZEN_BASE_URL
 
 # Same flow as packages/core/src/plugin/provider/opencode.ts in github.com/anomalyco/opencode
 OPENCODE_CONSOLE_URL = "https://opencode.ai/console"
 OPENCODE_CLIENT_ID = "opencode-cli"
 DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
-# App.useragent() (packages/core/src/app.ts) is `opencode/<channel>/<version>/<name>`;
-# the Console reads it to identify the client. Both are build-time defines upstream,
-# so they are overridable here instead of hardcoded.
-OPENCODE_CHANNEL = os.environ.get("OPENCODE_CHANNEL", "stable")
-# Mirrors the version the local opencode CLI reports. The gateway does not gate on it (verified
-# against 1.19.0 and a nonsense value), but a UA that contradicts the installed client is noise.
-OPENCODE_VERSION = os.environ.get("OPENCODE_CLIENT_VERSION", "1.19.0")
-OPENCODE_USER_AGENT = f"opencode/{OPENCODE_CHANNEL}/{OPENCODE_VERSION}/{OPENCODE_CLIENT_NAME}"
+# What the installed client actually puts on the wire (captured from opencode 1.18.31):
+#   opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14
+# The AI SDK appends its own half to the `opencode/<version>` the client supplies. The gateway does
+# not gate on this (verified against both this string and a nonsense value), but matching it keeps the
+# request indistinguishable from the app's, so every part is overridable instead of hardcoded.
+OPENCODE_VERSION = os.environ.get("OPENCODE_CLIENT_VERSION", "1.18.31")
+OPENCODE_SDK_VERSION = os.environ.get("OPENCODE_AI_SDK_VERSION", "4.0.23")
+OPENCODE_RUNTIME = os.environ.get("OPENCODE_RUNTIME", f"bun/{os.environ.get('OPENCODE_BUN_VERSION', '1.3.14')}")
+OPENCODE_USER_AGENT = (
+    f"opencode/{OPENCODE_VERSION} ai-sdk/provider-utils/{OPENCODE_SDK_VERSION} "
+    f"runtime/{OPENCODE_RUNTIME}"
+)
 HEADERS = {"Accept": "application/json", "User-Agent": OPENCODE_USER_AGENT}
 
 

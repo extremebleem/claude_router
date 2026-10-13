@@ -251,14 +251,20 @@ class SuppressDisconnectFilter(logging.Filter):
         return True
 
 
-def merge_opencode_models(models: list, now: float) -> list:
+def merge_opencode_models(models: list, now: float, free_only: bool = False) -> list:
     """Appends the Zen models the router can dispatch to. The catalogue is static and served from
     cache, so it is advertised on every path - including the ones where Google discovery failed,
-    which is exactly the state a Zen-only account is in."""
+    which is exactly the state a Zen-only account is in.
+
+    Without an OpenCode credential only the free models are reachable, so the paid ones are left out
+    rather than offered and then refused on every turn with AuthError."""
     iso_time = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
     catalog = peek_catalog()
     for model_id in sorted(catalog.get("models", {})):
         if (catalog["models"][model_id] or {}).get("disabled"):
+            continue
+        info = catalog["models"][model_id] or {}
+        if free_only and not info.get("free"):
             continue
         advertised = model_id if model_id == "space-bunny-free" else f"opencode/{model_id}"
         if any(m["id"] == advertised for m in models):
@@ -301,7 +307,7 @@ class ProxyApp:
         self.antigravity_client = AntigravityClient(token_manager)
         self.cloudcode_client = self.antigravity_client
         self.opencode_client = OpenCodeClient(token_manager)
-        self.router = ProviderRouter(self.antigravity_client, self.opencode_client)
+        self.router = ProviderRouter(self.antigravity_client, self.opencode_client, token_manager)
         self.http_session: Optional[ClientSession] = None
         self._models_cache = None
         self._models_cache_time = 0
@@ -705,7 +711,7 @@ class ProxyApp:
         t_start = time.time()
         active = self.token_manager.get_active_account(provider="opencode")
         account = (active.get("email") or active.get("id")) if active else "no-account"
-        chunks = self.opencode_client.generate_stream(body)
+        chunks = self.opencode_client.generate_stream(body, req_id=req_id)
 
         # Peek the first chunk: an upstream failure arrives as a single leading error event, and
         # reporting it as HTTP 200 makes the client treat a dead account as a healthy stream.
@@ -975,7 +981,7 @@ class ProxyApp:
             token, project_id = None, None
 
         if not token:
-            return merge_opencode_models(list(AVAILABLE_MODELS), now)
+            return merge_opencode_models(list(AVAILABLE_MODELS), now, self.router.opencode_free_only())
 
         try:
             loop = asyncio.get_running_loop()
@@ -1033,7 +1039,7 @@ class ProxyApp:
 
                 if results:
                     # Append OpenCode Zen models to dynamic model list
-                    merge_opencode_models(results, now)
+                    merge_opencode_models(results, now, self.router.opencode_free_only())
                     self._models_cache = results
                     self._models_cache_time = now
                     return results
@@ -1042,7 +1048,7 @@ class ProxyApp:
 
         # Discovery failed: the static catalogue still has to advertise Zen, or a Zen-only account
         # would see an empty model list and no way to pick one.
-        return merge_opencode_models(list(AVAILABLE_MODELS), now)
+        return merge_opencode_models(list(AVAILABLE_MODELS), now, self.router.opencode_free_only())
 
     async def handle_models(self, request: web.Request):
         models = await self.get_dynamic_models()
@@ -1181,7 +1187,8 @@ class ProxyApp:
             "total": len(data),
             "active_email": active_email,
             "opencode_accounts": self.opencode_accounts_info(),
-            "opencode_models": opencode_model_ids(),
+            "opencode_models": opencode_model_ids(self.router.opencode_free_only()),
+            "proxies": self.opencode_client.proxy_pool.status(),
             "gemini_api_key_configured": bool(self.token_manager.get_gemini_api_key())
         })
 
@@ -1401,6 +1408,7 @@ async def run_server(host: str = "127.0.0.1", port: int = 8080, session_auth_tok
             pass
         finally:
             await runner.cleanup()
+            await proxy.opencode_client.proxy_pool.close()
 
 
 if __name__ == "__main__":

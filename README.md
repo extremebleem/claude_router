@@ -32,14 +32,23 @@ Enables running the **Claude Code CLI** in a fully isolated sandbox, while also 
 
 5. **Second Provider: OpenCode Zen**:
    * Model ids starting with `opencode/` (plus `space-bunny-free` and the other `*-free` ids) are routed to `https://opencode.ai/inference/v1` instead of Cloud Code.
+   * **No account needed for the free models.** With an empty pool the proxy sends the same `Bearer public` the opencode client sends when nobody is logged in, and only the free models are advertised. Signing in is what adds the paid ones.
    * Sign in with the Console device flow (`python cli_auth.py login --provider opencode`) or with a Console API key (`--api-key <KEY>`).
    * Requests are translated to Zen's OpenAI-compatible shape, matching what the opencode app itself sends.
    * The model list, output caps and endpoint are read from the account's Console config, so a model that appears, disappears or changes price shows up without a code change.
    * Zen accounts live in the same pool as Google accounts but keep their own active pointer, so switching one never disturbs the other.
    * `python cli_auth.py check --provider opencode` sends one real request and reports what is reachable.
 
-   Note: Zen serves its free (`cost: 0`) models to the official OpenCode client. A Console **session**
-   token gets `403 FreeTierError` on them; use a Console **API key** for those models.
+   Note: the anonymous free tier is **narrower than it looks**. Measured against the live gateway on
+   2026-10-14, a `Bearer public` request is served only when all three hold: it is streamed
+   (`stream: true`), it advertises the tool names the opencode client uses (`bash` and `read` are the
+   minimum), and it names its session in opencode's id format. The tool check is shallow — names only,
+   descriptions and schemas are ignored, extra tools are allowed — so the proxy keeps Claude Code's own
+   tools untouched and adds two reserved copies under those names (`transformer/opencode_tool_alias.py`);
+   a call that lands on a reserved name is routed back to the tool the harness runs. The session id is a
+   port of `packages/schema/src/identifier.ts` in `transformer/opencode_ids.py`. A request that still
+   fails gets `403 FreeTierError`, turned into a `permission_error` naming the likely cause. A Console
+   **API key** removes the restriction and is required for paid models.
 
 ---
 

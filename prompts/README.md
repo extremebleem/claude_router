@@ -17,4 +17,12 @@ System prompts copied from the opencode app (github.com/anomalyco/opencode, form
 
 Every file above **must** contain `${OPENCODE_TOOL_GUIDANCE}` — the override templates replace `system.txt` outright, so without the placeholder the `shell`/`write`/`edit` guidance is silently dropped for that model. `tests/test_opencode_client.py` asserts this.
 
-The client's own system text (CLAUDE.md etc.) follows the opencode prompt; the Claude Code identity line and billing header are dropped.
+## prompts/claude_cli_agent.md
+Our own prompt for the Zen provider: the CLI agent harness the model is driven by, plus the tools the request actually carries. `${CLAUDE_CLI_TOOL_GUIDANCE}` is filled from `_CLI_TOOLS` in `transformer/opencode_prompts.py` with one line per tool present in `request.tools` — a tool the catalog does not know (an MCP tool, a renamed one) gets no line and the whole section disappears. Add new tools to `_CLI_TOOLS`, not here.
+
+Zen receives these as **three system messages**, in this order (`build_opencode_system`):
+1. opencode's own prompt, verbatim, so the gateway sees the prefix it sees from the opencode client;
+2. this file, describing the harness and the tools of that request;
+3. the client's own instructions (CLAUDE.md, environment) — dropped when it sends none.
+
+The Antigravity identity never goes to Zen; it belongs to the Cloud Code backend only. Set `OPENCODE_MERGE_SYSTEM_BLOCKS=1` to fold all three into a single system message if a gateway ever refuses more than one leading system turn.

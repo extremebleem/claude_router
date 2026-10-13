@@ -9,8 +9,22 @@ import aiohttp
 
 from auth.opencode_oauth import OPENCODE_USER_AGENT
 from auth.opencode_catalog import get_catalog, output_limit
-from config import OPENCODE_CLIENT_NAME, OPENCODE_PROJECT_ID, OPENCODE_ZEN_BASE_URL
-from logger import log
+from backend.proxy_pool import ProxyPool, mask_proxy
+from backend.router import is_free_tier_model
+from config import (
+    OPENCODE_CLIENT_NAME,
+    OPENCODE_MERGE_SYSTEM_BLOCKS,
+    OPENCODE_PROJECT_ID,
+    OPENCODE_ZEN_BASE_URL,
+    SAVE_DETAILED_REQUEST_LOGS,
+)
+from logger import LOGS_DIR, log
+from transformer.opencode_ids import message_identifier, session_identifier
+from transformer.opencode_tool_alias import (
+    client_tool_name,
+    free_tier_markers,
+    missing_free_tier_tools,
+)
 from transformer.opencode_prompts import (
     DROP_TOKEN_ACCOUNTING,
     build_opencode_system,
@@ -22,7 +36,24 @@ DEFAULT_ZEN_MODEL = "space-bunny-free"
 REQUEST_TIMEOUT_SECONDS = 300
 DEFAULT_COOLDOWN_SECONDS = 600.0
 
-NO_ACCOUNT_MESSAGE = "No active OpenCode account configured. Run 'python cli_auth.py login --provider opencode' first."
+# What the opencode client itself sends when nobody is logged in
+# (packages/core/src/plugin/provider/opencode.ts: with no credential the provider is given the literal
+# apiKey "public" and every model with a non-zero input cost is switched off). Verified against the
+# live gateway on 2026-10-14: `Bearer public` + a streamed request + a non-empty tools array is
+# accepted for the free models and refused for the paid ones with AuthError "Missing API key".
+PUBLIC_TOKEN = "public"
+ANONYMOUS_ACCOUNT = {"id": "public@opencode", "email": "public@opencode", "anonymous": True}
+
+PAID_NEEDS_ACCOUNT_MESSAGE = (
+    "This OpenCode model is paid and needs a Console API key: "
+    "python cli_auth.py login --provider opencode --api-key <KEY>. Free models work without one."
+)
+FREE_TIER_REFUSED_MESSAGE = (
+    "OpenCode refused the anonymous free tier for this request. The gateway only serves it to a turn "
+    "that is streamed, carries tools under opencode's own names, and names a session in opencode's "
+    "format - all of which this proxy does, so the client may be too new or too old for it. A Console "
+    "API key removes the restriction: python cli_auth.py login --provider opencode --api-key <KEY>"
+)
 
 # Zen's per-model output cap is not published, so a Claude Code turn asking for max_tokens: 32000 can
 # come back as a 400. Only a complaint that names the token cap triggers the retry below.
@@ -157,7 +188,7 @@ def _reasoning_effort(anthropic_req: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def anthropic_to_opencode_payload(anthropic_req: Dict[str, Any]) -> Dict[str, Any]:
+def anthropic_to_opencode_payload(anthropic_req: Dict[str, Any], free_tier_markers_on_wire: bool = False) -> Dict[str, Any]:
     """Translates an Anthropic Messages API payload into the OpenAI-compatible Chat Completions
     payload opencode sends to Zen.
 
@@ -166,15 +197,22 @@ def anthropic_to_opencode_payload(anthropic_req: Dict[str, Any]) -> Dict[str, An
         <system-update> user messages (opencode itself never emits a bare mid-array system role).
       * Zen receives the bare model id, without the opencode/ provider prefix.
       * tool schemas carry strict:false, which is what opencode emits for this provider.
+      * with free_tier_markers_on_wire two extra tools go out under the names the anonymous free tier
+        looks for; the client's own tools are untouched. Pass it only when no credential is in play.
     """
     messages: List[Dict[str, Any]] = []
     raw_model = anthropic_req.get("model") or DEFAULT_ZEN_MODEL
     tool_names = [t.get("name", "") for t in anthropic_req.get("tools") or []]
 
-    # opencode's own system prompt for this model, then the client's instructions
-    sys_text = build_opencode_system(raw_model, anthropic_req.get("system"), tool_names)
-    if sys_text:
-        messages.append({"role": "system", "content": sys_text})
+    # opencode's own system prompt for this model, then the CLI agent prompt with the tools this
+    # request carries, then the client's own instructions. Each block is its own system message so
+    # the opencode prefix stays byte-identical to what the opencode client sends; set
+    # OPENCODE_MERGE_SYSTEM_BLOCKS if a gateway ever refuses more than one leading system turn.
+    sys_blocks = build_opencode_system(raw_model, anthropic_req.get("system"), tool_names)
+    if OPENCODE_MERGE_SYSTEM_BLOCKS:
+        sys_blocks = ["\n\n".join(sys_blocks)]
+    for block in sys_blocks:
+        messages.append({"role": "system", "content": block})
 
     # System updates are buffered so they never land between an assistant tool_calls turn and the
     # tool messages answering it, which Chat Completions requires to be adjacent.
@@ -282,6 +320,9 @@ def anthropic_to_opencode_payload(anthropic_req: Dict[str, Any]) -> Dict[str, An
     # Translate tools if present
     tools = anthropic_req.get("tools")
     if tools:
+        # Every tool the client sends is forwarded, schema untouched - the CLI agent only ever offers
+        # the tools its harness runs, so dropping "unknown" ones would silently shrink what the model
+        # can do. strict:false is what opencode emits for this provider.
         payload["tools"] = [{
             "type": "function",
             "function": {
@@ -298,6 +339,11 @@ def anthropic_to_opencode_payload(anthropic_req: Dict[str, Any]) -> Dict[str, An
             payload["tool_choice"] = {"type": "function", "function": {"name": choice.get("name")}}
         elif choice.get("type") in TOOL_CHOICES:
             payload["tool_choice"] = TOOL_CHOICES[choice["type"]]
+
+    if free_tier_markers_on_wire and payload.get("tools"):
+        # The names are added, not substituted: the client's own tools go out exactly as written, so
+        # the model keeps the surface Claude Code gave it and the history stays consistent.
+        payload["tools"] = payload["tools"] + free_tier_markers(payload["tools"])
 
     effort = _reasoning_effort(anthropic_req)
     if effort:
@@ -322,16 +368,16 @@ def _session_seed(anthropic_req: Dict[str, Any]) -> str:
     return json.dumps(first.get("content", ""), sort_keys=True)
 
 
+# The id itself is built by transformer/opencode_ids.py: the gateway only admits an anonymous turn
+# whose x-opencode-session carries opencode's own shape (see that module for the port and the shape).
 def conversation_session_id(anthropic_req: Dict[str, Any]) -> str:
-    """Stable opencode-style session id (ses_ + 64 hex) per conversation, so the Zen cache affinity works."""
-    return "ses_" + hashlib.sha256(_session_seed(anthropic_req).encode("utf-8")).hexdigest()
+    """Stable opencode-style session id per conversation.
 
-
-def conversation_affinity(anthropic_req: Dict[str, Any]) -> str:
-    """Upstream affinity is parentID ?? fork?.sessionID ?? session.id (packages/core/src/session/affinity.ts).
-    The Anthropic payload carries no parent-session signal - Claude Code subagents inherit the same
-    metadata.user_id - so the affinity collapses to the session id."""
-    return conversation_session_id(anthropic_req)
+    It doubles as the affinity key. Upstream that is parentID ?? fork?.sessionID ?? session.id
+    (packages/core/src/session/affinity.ts), but the Anthropic payload carries no parent-session
+    signal - Claude Code subagents inherit the same metadata.user_id - so it collapses to the id.
+    """
+    return session_identifier(_session_seed(anthropic_req))
 
 
 def _sse(event: str, data: Dict[str, Any]) -> str:
@@ -340,6 +386,16 @@ def _sse(event: str, data: Dict[str, Any]) -> str:
 
 def _error(kind: str, message: str) -> str:
     return _sse("error", {"type": "error", "error": {"type": kind, "message": message}})
+
+
+def _save_payload(req_id: str, payload: Dict[str, Any]) -> None:
+    """Writes the outgoing Zen request next to the incoming one. The system blocks and the tool set
+    the gateway actually saw are otherwise invisible, which is the only way to check them live."""
+    try:
+        path = LOGS_DIR / f"req_{req_id}_opencode_payload.json"
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        log(f"[Logging Error] {e}", level="ERROR")
 
 
 def _dummy_signature(msg_id: str, index: int) -> str:
@@ -443,20 +499,18 @@ def upstream_error_kind(detail: str) -> Optional[str]:
 # Policy refusals: the credential works, the account is simply not allowed to run this model.
 # Cooling the account down for these would mute a perfectly good login.
 POLICY_ERRORS: Dict[str, Tuple[str, str]] = {
-    "FreeTierError": (
-        "permission_error",
-        "OpenCode serves its free-tier models only to its own client; a Console session token is not "
-        "enough. Create an API key at https://opencode.ai/console and run "
-        "'python cli_auth.py login --provider opencode --api-key <KEY>'",
-    ),
+    "FreeTierError": ("permission_error", FREE_TIER_REFUSED_MESSAGE),
     "RegionError": ("permission_error", "This OpenCode model is not available in your region."),
     "ModelDeprecated": ("not_found_error", "This OpenCode model has been deprecated and was removed from Zen."),
 }
 
 
 class OpenCodeClient:
-    def __init__(self, token_manager, base_url: str = OPENCODE_ZEN_BASE_URL, http_session=None):
+    def __init__(self, token_manager, base_url: str = OPENCODE_ZEN_BASE_URL, http_session=None,
+                 proxy_pool: Optional[ProxyPool] = None):
         self.token_manager = token_manager
+        # Outbound IPs: a throttled route hands the turn to the next one before an account is cooled down
+        self.proxy_pool = proxy_pool or ProxyPool(token_manager)
         self.base_url = base_url.rstrip("/")
         # Reused across requests; a fresh session per turn would pay a full TLS handshake every time.
         self.http_session = http_session
@@ -469,31 +523,46 @@ class OpenCodeClient:
         return self._catalog
 
     def _candidate_accounts(self, model_name: str) -> List[Dict[str, Any]]:
-        """Accounts to try for this model, active one first. Empty when the pool is empty or
-        every entry is cooling down - the caller turns that into the right error."""
-        if not self.token_manager:
-            return []
-        return self.token_manager.get_available_accounts(
-            model_name, provider="opencode", allow_cooldown_fallback=False
-        )
+        """Accounts to try for this model, active one first. Empty when every entry is cooling down
+        and no anonymous turn is possible - the caller turns that into the right error.
+
+        With no credential at all the free models still work: the opencode client sends the literal
+        token "public" for them, so the same thing is offered here as a synthetic account. A paid
+        model gets none, because the gateway answers that with AuthError rather than a free-tier one.
+        """
+        accounts = []
+        if self.token_manager:
+            accounts = self.token_manager.get_available_accounts(
+                model_name, provider="opencode", allow_cooldown_fallback=False
+            )
+        if not accounts and is_free_tier_model(model_name):
+            return [ANONYMOUS_ACCOUNT]
+        return accounts
 
     def _request_headers(self, token: str, anthropic_req: Dict[str, Any],
-                         catalog: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+                         catalog: Optional[Dict[str, Any]] = None,
+                         message_id: Optional[str] = None) -> Dict[str, str]:
         # Same headers opencode adds to every model request (session/model-request.ts), plus
         # whatever the Console handed this account (x-opencode-org-id), which it uses to attribute
         # the request to the workspace.
-        affinity = conversation_affinity(anthropic_req)
+        # The id is computed once: it is stamped on first use, and a second lookup could in principle
+        # land after the stamp cache dropped this conversation and return a different id, which would
+        # put two different sessions in the headers of one request.
+        session_id = conversation_session_id(anthropic_req)
         headers = {
             "Authorization": f"Bearer {token}",
-            "x-opencode-session-id": conversation_session_id(anthropic_req),
-            "x-session-affinity": affinity,
-            "X-Session-Id": affinity,
+            "x-opencode-session-id": session_id,
+            "x-session-affinity": session_id,
+            "X-Session-Id": session_id,
             "User-Agent": OPENCODE_USER_AGENT,
             "x-opencode-project": OPENCODE_PROJECT_ID,
-            "x-opencode-session": affinity,
+            "x-opencode-session": session_id,
             "x-opencode-client": OPENCODE_CLIENT_NAME,
             "Content-Type": "application/json",
         }
+        # The Console forwards this one to the inference service as x-opencode-request-id.
+        if message_id:
+            headers["x-opencode-request"] = message_id
         headers.update((catalog or {}).get("headers") or {})
         return headers
 
@@ -525,7 +594,8 @@ class OpenCodeClient:
             return kind, f"OpenCode billing error for {ident}: {detail}"
         return kind, f"OpenCode API error ({status}): {detail}"
 
-    async def generate_stream(self, anthropic_req: Dict[str, Any], headers: Optional[Dict[str, str]] = None) -> AsyncGenerator[str, None]:
+    async def generate_stream(self, anthropic_req: Dict[str, Any], headers: Optional[Dict[str, str]] = None,
+                              req_id: Optional[str] = None) -> AsyncGenerator[str, None]:
         """Streams responses from OpenCode Zen API and yields SSE formatted chunks in Anthropic
         Messages style, failing over across the account pool when one is throttled or rejected."""
         model_name = zen_model_id(anthropic_req.get("model"))
@@ -535,8 +605,13 @@ class OpenCodeClient:
             if wait > 0:
                 yield _error("rate_limit_error",
                              f"All OpenCode accounts are rate limited for {model_name}; retry in {int(wait)}s")
+            elif is_free_tier_model(model_name):
+                # Only a cooldown can have emptied the pool here; without one the free models run
+                # anonymously. Kept distinct so the reason is never guessed at from the outside.
+                yield _error("rate_limit_error",
+                             f"OpenCode free models are temporarily unavailable for {model_name}; retry shortly")
             else:
-                yield _error("authentication_error", NO_ACCOUNT_MESSAGE)
+                yield _error("permission_error", PAID_NEEDS_ACCOUNT_MESSAGE)
             return
 
         # The account's own endpoint and org header come from the Console config; the documented
@@ -545,7 +620,8 @@ class OpenCodeClient:
         base_url = (catalog.get("base_url") or self.base_url).rstrip("/")
         url = f"{base_url}/chat/completions"
         cap = output_limit(catalog, model_name)
-        msg_id = f"msg_{int(time.time() * 1000)}"
+        # opencode's own message id, which also rides along as x-opencode-request.
+        msg_id = message_identifier(f"{req_id or 'stream'}:{time.time_ns()}")
         owned_session = self.http_session
         if owned_session is None:
             owned_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS))
@@ -553,25 +629,58 @@ class OpenCodeClient:
         try:
             last_error: Optional[Tuple[str, str]] = None
             for account in accounts:
-                # Token refresh is a blocking HTTP call; keep it off the event loop
-                token, _ = await asyncio.to_thread(self.token_manager.get_token_for_account, account)
+                # Anonymous turns carry the literal "public" token and never touch the pool; a real
+                # account refreshes, which is a blocking HTTP call, so keep it off the event loop.
+                if account.get("anonymous"):
+                    token = PUBLIC_TOKEN
+                else:
+                    token, _ = await asyncio.to_thread(self.token_manager.get_token_for_account, account)
                 if not token:
                     last_error = ("authentication_error",
                                   f"OpenCode account '{_account_id(account)}' has no usable access token")
                     continue
 
-                payload = anthropic_to_opencode_payload(anthropic_req)
+                anonymous = bool(account.get("anonymous"))
+                payload = anthropic_to_opencode_payload(anthropic_req, free_tier_markers_on_wire=anonymous)
                 payload["stream"] = True
                 payload["stream_options"] = {"include_usage": True}
                 # Claude Code always asks for its own max_tokens; the catalogue knows the real cap.
                 if cap and payload.get("max_completion_tokens", 0) > cap:
                     payload["max_completion_tokens"] = cap
+                if anonymous:
+                    # The free tier is only served to a request that advertises the tool names the
+                    # opencode client uses. Claude Code sends Bash and Read, so the markers are
+                    # copies of them; a request without either is refused, and says so here first.
+                    missing = missing_free_tier_tools(payload.get("tools") or [])
+                    if missing:
+                        log(f"[OpenCode] anonymous turn has no tool to answer {', '.join(missing)}; "
+                            "Zen will refuse the free tier", level="WARN")
+                if SAVE_DETAILED_REQUEST_LOGS and req_id:
+                    _save_payload(req_id, payload)
 
-                try:
-                    response = await self._post(
-                        owned_session, url, payload, self._request_headers(token, anthropic_req, catalog))
-                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                    last_error = ("api_error", f"OpenCode connection error: {e}")
+                request_headers = self._request_headers(token, anthropic_req, catalog, message_id=msg_id)
+                response = None
+                for route in self.proxy_pool.routes():
+                    session, extra = self.proxy_pool.session_for(route, owned_session)
+                    try:
+                        response = await self._post(session, url, payload, request_headers, **extra)
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                        self.proxy_pool.mark_limited(route, failed=True)
+                        last_error = ("api_error", f"OpenCode connection error via {mask_proxy(route)}: {e}")
+                        response = None
+                        continue
+                    if response.status == 429 and self.proxy_pool.has_alternative(route):
+                        # This IP is out of quota; the same turn goes out through the next one
+                        retry_after = response.headers.get("Retry-After", "")
+                        self.proxy_pool.mark_limited(route, float(retry_after) if retry_after.isdigit() else None)
+                        last_error = ("rate_limit_error", f"OpenCode 429 via {mask_proxy(route)}")
+                        response.release()
+                        response = None
+                        continue
+                    if response.status == 200:
+                        self.proxy_pool.mark_good(route)
+                    break
+                if response is None:
                     continue
 
                 if response.status != 200:
@@ -582,7 +691,7 @@ class OpenCodeClient:
                     continue
 
                 try:
-                    async for chunk in self._relay(response, msg_id, model_name):
+                    async for chunk in self._relay(response, msg_id, model_name, route_reserved_tools=anonymous):
                         yield chunk
                 except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                     yield _error("api_error", f"OpenCode connection error: {e}")
@@ -597,14 +706,14 @@ class OpenCodeClient:
                 await owned_session.close()
 
     async def _post(self, session, url: str, payload: Dict[str, Any],
-                    headers: Dict[str, str]) -> aiohttp.ClientResponse:
+                    headers: Dict[str, str], **extra) -> aiohttp.ClientResponse:
         """Posts the turn, retrying once without the output cap when the model refuses the cap.
 
         Claude Code always asks for its own max_tokens (32000), while a free Zen model caps output
         far below that and answers with a 400 naming the limit. Dropping the field lets the model
         use its own default, which is what opencode does when a provider has no advertised cap.
         """
-        response = await session.post(url, json=payload, headers=headers)
+        response = await session.post(url, json=payload, headers=headers, **extra)
         if response.status == 400 and "max_completion_tokens" in payload:
             # Reading the body caches it, so the caller still gets a readable error if we do not retry.
             detail = await _safe_text(response)
@@ -613,11 +722,11 @@ class OpenCodeClient:
                 log(f"[OpenCode] {model_hint(payload)} refused the requested output cap, "
                     f"retrying without max_completion_tokens", level="WARN")
                 trimmed = {k: v for k, v in payload.items() if k != "max_completion_tokens"}
-                return await session.post(url, json=trimmed, headers=headers)
+                return await session.post(url, json=trimmed, headers=headers, **extra)
         return response
 
     async def _relay(self, response: aiohttp.ClientResponse, msg_id: str,
-                     model_name: str) -> AsyncGenerator[str, None]:
+                     model_name: str, route_reserved_tools: bool = False) -> AsyncGenerator[str, None]:
         """Translates Zen's OpenAI chat-completion chunks into Anthropic Messages SSE."""
         yield _sse("message_start", {
             "type": "message_start",
@@ -704,9 +813,14 @@ class OpenCodeClient:
                 up_index = call.get("index", 0)
                 fn = call.get("function") or {}
                 if up_index not in tool_blocks:
+                    name = fn.get("name", "")
+                    if route_reserved_tools:
+                        # A call to one of the reserved names is routed to the tool the harness runs,
+                        # so a model that ignored the "do not call this" note still gets its work done.
+                        name = client_tool_name(name) or name
                     block = {
                         "type": "tool_use", "id": call.get("id") or f"toolu_{msg_id}_{up_index}",
-                        "name": fn.get("name", ""), "input": {},
+                        "name": name, "input": {},
                     }
                     for event in switch_block(f"tool_use:{up_index}", block):
                         yield _sse(event["type"], event)

@@ -1,6 +1,6 @@
 from typing import Any, Optional, Dict, List
 
-from auth.opencode_catalog import routable_models
+from auth.opencode_catalog import free_models, routable_models
 from auth.opencode_catalog import peek_catalog as peek
 
 # Advertised when the live catalogue has not been fetched yet. It is a snapshot, not a source of
@@ -31,20 +31,38 @@ def is_free_tier_model(model_id: str) -> bool:
     return bare.endswith(FREE_MODEL_SUFFIXES) or bare in FREE_MODEL_IDS
 
 
-def opencode_model_ids() -> List[str]:
-    """Ids advertised for Zen: the live catalogue when warm, the snapshot otherwise."""
-    live = routable_models(peek())
+def opencode_model_ids(free_only: bool = False) -> List[str]:
+    """Ids advertised for Zen: the live catalogue when warm, the snapshot otherwise.
+
+    Without a credential only the free models are reachable, so advertising the paid ones would
+    offer the client a model whose every turn fails with AuthError.
+    """
+    catalog = peek()
+    live = routable_models(catalog)
+    if free_only:
+        reachable = set(free_models(catalog))
+        live = [m for m in live if m in reachable]
     if not live:
-        return list(OPENCODE_MODELS)
+        return [m for m in OPENCODE_MODELS if not free_only or is_free_tier_model(m)]
     # space-bunny-free stays unprefixed so the common case stays short to type; the rest carry the
     # namespace the client must send, matching how opencode itself names them.
     return [m if m == "space-bunny-free" else f"opencode/{m}" for m in sorted(live)]
 
 
 class ProviderRouter:
-    def __init__(self, antigravity_client: Any, opencode_client: Any):
+    def __init__(self, antigravity_client: Any, opencode_client: Any, token_manager: Any = None):
         self.antigravity_client = antigravity_client
         self.opencode_client = opencode_client
+        self.token_manager = token_manager
+
+    def opencode_free_only(self) -> bool:
+        """True when Zen has no credential, so only its free models can actually be served."""
+        if self.token_manager is None:
+            return True
+        try:
+            return not self.token_manager.get_accounts(provider="opencode")
+        except Exception:
+            return True
 
     def resolve_provider(self, model: str) -> str:
         model_lower = (model or "").strip().lower()
@@ -64,7 +82,7 @@ class ProviderRouter:
 
     def list_all_models(self, antigravity_models: Optional[List[str]] = None) -> List[str]:
         models = list(antigravity_models or [])
-        for m in opencode_model_ids():
+        for m in opencode_model_ids(free_only=self.opencode_free_only()):
             if m not in models:
                 models.append(m)
         return models

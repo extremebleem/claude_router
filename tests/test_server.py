@@ -401,7 +401,7 @@ class TestServerEndpoints(AioHTTPTestCase):
             {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 2}},
         ]
 
-        def fake_stream(body):
+        def fake_stream(body, headers=None, req_id=None):
             async def gen():
                 for e in events:
                     yield f"event: {e['type']}\ndata: {json.dumps(e)}\n\n"

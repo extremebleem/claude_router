@@ -8,16 +8,25 @@ The text files live in prompts/opencode/ and can be edited without code changes.
 
 Every override template carries the ${OPENCODE_TOOL_GUIDANCE} placeholder; without it the
 shell/write/edit guidance would be silently dropped for that model.
+
+Zen receives three system blocks, each its own message (build_opencode_system):
+  1. opencode's prompt, verbatim, so the gateway sees the prefix it sees from the opencode client;
+  2. prompts/claude_cli_agent.md - the CLI agent harness and the tools this request carries, with
+     ${CLAUDE_CLI_TOOL_GUIDANCE} filled from _CLI_TOOLS;
+  3. the client's own instructions (CLAUDE.md, environment).
+Nothing here carries the Antigravity identity: that is for the Cloud Code backend only.
 """
 
 import re
-from typing import Any, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from transformer.prompts import load_prompt_file
 
 TOOL_GUIDANCE_PLACEHOLDER = "${OPENCODE_TOOL_GUIDANCE}"
+CLAUDE_CLI_TOOL_GUIDANCE_PLACEHOLDER = "${CLAUDE_CLI_TOOL_GUIDANCE}"
 # Matches the placeholder alone or followed by its line break, so the whole line goes.
 _GUIDANCE_PLACEHOLDER_RE = re.compile(re.escape(TOOL_GUIDANCE_PLACEHOLDER) + r"\n?")
+_CLI_GUIDANCE_PLACEHOLDER_RE = re.compile(re.escape(CLAUDE_CLI_TOOL_GUIDANCE_PLACEHOLDER) + r"\n?")
 
 # Claude Code appends its own context-budget bookkeeping to the system prompt and interleaves
 # system turns between every model turn. It is not an instruction for the model, and passing it
@@ -78,6 +87,67 @@ def render_prompt(template: str, tool_names: List[str]) -> str:
     return _GUIDANCE_PLACEHOLDER_RE.sub(lambda _: filled, template)
 
 
+# The CLI agent's tools, keyed by the name Claude Code puts in request.tools. One line each, taken
+# from the harness' own tool help; the second system block lists exactly the ones a request carries.
+# Insertion order is the render order, so the block stays byte-stable for a given tool set and the
+# gateway keeps its prefix cache. A tool missing here (an MCP server, a renamed one) is simply not
+# described in prose - its schema already reaches the model through payload["tools"].
+_CLI_TOOLS: Dict[str, str] = {
+    # Filesystem
+    "Read": "Reads a file from the local filesystem; the output is line-numbered, so a line it shows can be quoted straight into an Edit.",
+    "Write": "Writes a file to the local filesystem, creating it or replacing its content entirely.",
+    "Edit": "Replaces one exact string in an existing text file; `old_string` must match character for character (indentation included) and occur exactly once unless `replace_all` is set.",
+    "NotebookEdit": "Replaces, inserts or deletes a single cell of a Jupyter notebook (.ipynb).",
+    "Glob": "Fast file pattern matching by glob (`**/*.js`, `src/**/*.ts`); returns matching paths sorted by modification time.",
+    "Grep": "Content search built on ripgrep; prefer it over grep/rg through Bash, its results integrate with file links.",
+    # Execution
+    "Bash": "Executes a bash command and returns its output; the only way to run a command, a build, a test or git.",
+    # Web
+    "WebSearch": "Searches the web and returns result blocks with titles and URLs.",
+    "WebFetch": "Fetches a URL, converts the page to markdown and answers a prompt against it with a small fast model.",
+    # Agents and tasks
+    "Agent": "Launches a subagent for a complex multi-step task; every agent type brings its own capabilities and tools.",
+    "Skill": "Invokes a skill, i.e. a packaged instruction set for one particular kind of task.",
+    "SendMessage": "Sends a message to another agent or session by the name ListAgents prints.",
+    "ListAgents": "Lists the agents and sessions that SendMessage can address.",
+    "TaskCreate": "Creates a task in the session task list, to track multi-step work.",
+    "TaskUpdate": "Updates a task in the session task list (status, description, owner).",
+    "TaskGet": "Returns one task from the session task list by id.",
+    "TaskList": "Lists the tasks of the session task list.",
+    "TaskStop": "Stops a running background task by id.",
+    "Workflow": "Runs a workflow script that orchestrates several subagents deterministically in the background.",
+    "ScheduleWakeup": "Schedules when to resume work, used by /loop sessions without an interval.",
+    "CronCreate": "Schedules a prompt to be enqueued at a future time, recurring or one-shot.",
+    "CronDelete": "Cancels a job previously scheduled with CronCreate.",
+    "CronList": "Lists the jobs scheduled with CronCreate.",
+    # Session and interaction
+    "AskUserQuestion": "Asks the user to choose between options, for a decision that is genuinely theirs to make.",
+    "EnterPlanMode": "Switches into plan mode to research an approach and get sign-off before implementing it.",
+    "ExitPlanMode": "Leaves plan mode by presenting the finished plan for approval.",
+    "EnterWorktree": "Creates an isolated git worktree and moves the session into it; only on an explicit request.",
+    "ExitWorktree": "Leaves a worktree session created by EnterWorktree and returns to the original directory.",
+    "DesignSync": "Reads and updates the user's design-system projects through their claude.ai login, for the /design-sync skill.",
+    "ReportFindings": "Reports code-review findings as a typed list the host UI renders.",
+}
+
+
+CLI_TOOL_SECTION_HEADING = "# Tools available in this session"
+
+
+def render_claude_cli_prompt(template: str, tool_names: List[str]) -> str:
+    """Fills the CLI agent prompt with the tools this request actually carries.
+
+    A tool the catalog does not know gets no prose line: the heading and the placeholder block are
+    dropped together rather than leaving an empty section, the same way the opencode guidance
+    placeholder behaves. The names are the ones the client sent and the schemas carry, because
+    nothing on the wire renames them.
+    """
+    present = {n for n in tool_names if n in _CLI_TOOLS}
+    listing = "\n".join(f"- **{name}**: {_CLI_TOOLS[name]}" for name in _CLI_TOOLS if name in present)
+    filled = f"{CLI_TOOL_SECTION_HEADING}\n{listing}\n" if listing else ""
+    return _CLI_GUIDANCE_PLACEHOLDER_RE.sub(lambda _: filled, template)
+
+
 def model_prompt(model: str) -> tuple:
     """Port of plugin/optimize.ts: returns (file, mode) for the model, or None to keep the base prompt."""
     m = (model or "").lower().split("/")[-1]
@@ -120,8 +190,25 @@ def build_opencode_system(
     model: str,
     raw_system: Optional[Union[str, List[Any]]],
     tool_names: List[str],
-) -> str:
-    """opencode's own system prompt for the model, followed by the client's instructions (CLAUDE.md etc.)."""
+) -> List[str]:
+    """The system blocks Zen receives, in order:
+
+    1. opencode's own prompt for the model - verbatim, so the gateway sees the same prefix it would
+       see from the opencode client itself.
+    2. the CLI agent prompt: what harness the model is driven by and which tools it has, rendered
+       from the tools of this request. It is a separate block on purpose: block 1 must stay
+       byte-identical to upstream, and the tool list changes with the client's tool set while
+       block 1 does not.
+    3. the client's own instructions (CLAUDE.md, environment), dropped when it sends none.
+    """
+    blocks = [_opencode_prompt(model, tool_names), _claude_cli_prompt(tool_names)]
+    client = _client_system_text(raw_system)
+    if client:
+        blocks.append(client)
+    return [b for b in blocks if b]
+
+
+def _opencode_prompt(model: str, tool_names: List[str]) -> str:
     base = load_prompt_file("opencode/system.txt")
     chosen = model_prompt(model)
     if chosen:
@@ -135,4 +222,8 @@ def build_opencode_system(
             base = render_prompt(base, tool_names)
     else:
         base = render_prompt(base, tool_names)
-    return "\n\n".join(p for p in (base, _client_system_text(raw_system)) if p)
+    return base
+
+
+def _claude_cli_prompt(tool_names: List[str]) -> str:
+    return render_claude_cli_prompt(load_prompt_file("claude_cli_agent.md"), tool_names)

@@ -16,7 +16,25 @@ from backend.opencode import (
 )
 from auth.opencode_catalog import static_snapshot
 from server import ProxyApp
-from transformer.opencode_prompts import TOOL_GUIDANCE_PLACEHOLDER, build_opencode_system
+from transformer.opencode_prompts import (
+    CLAUDE_CLI_TOOL_GUIDANCE_PLACEHOLDER,
+    TOOL_GUIDANCE_PLACEHOLDER,
+    build_opencode_system,
+)
+
+
+def conversation_turns(payload):
+    """The payload's messages without the leading system blocks.
+
+    A request carries up to three of them - opencode's own prompt, the CLI agent prompt with this
+    request's tools, and the client's instructions - and how many there are depends on the request,
+    so tests slice them off by role instead of by index.
+    """
+    return [m for m in payload["messages"] if m["role"] != "system"]
+
+
+def system_blocks(payload):
+    return [m["content"] for m in payload["messages"] if m["role"] == "system"]
 
 _catalog_patcher = None
 
@@ -100,10 +118,13 @@ class TestPayloadTranslation(unittest.TestCase):
         self.assertEqual(oc_req["messages"][0]["role"], "system")
         sys_text = oc_req["messages"][0]["content"]
         self.assertTrue(sys_text.startswith("You are an AI agent running in OpenCode"))
-        self.assertTrue(sys_text.endswith("You are a helpful assistant."))
         self.assertNotIn(TOOL_GUIDANCE_PLACEHOLDER, sys_text)
-        self.assertEqual(oc_req["messages"][1]["role"], "user")
-        self.assertEqual(oc_req["messages"][1]["content"], "Hello")
+        # The client's own text follows as its own block, after the CLI agent prompt.
+        self.assertEqual([m["role"] for m in oc_req["messages"][:3]], ["system"] * 3)
+        self.assertTrue(oc_req["messages"][1]["content"].startswith("You are the coding agent"))
+        self.assertEqual(oc_req["messages"][2]["content"], "You are a helpful assistant.")
+        self.assertEqual(oc_req["messages"][3]["role"], "user")
+        self.assertEqual(oc_req["messages"][3]["content"], "Hello")
         self.assertEqual(oc_req["max_completion_tokens"], 1000)
         self.assertNotIn("max_tokens", oc_req)
 
@@ -124,7 +145,7 @@ class TestPayloadTranslation(unittest.TestCase):
                 {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}},
             ]},
         ]}
-        msgs = anthropic_to_opencode_payload(req)["messages"][1:]  # [0] is the opencode system prompt
+        msgs = conversation_turns(anthropic_to_opencode_payload(req))
         self.assertIsNone(msgs[0]["content"])
         self.assertEqual(msgs[1], {"role": "tool", "tool_call_id": "t1", "content": "ok"})
         self.assertEqual(msgs[2]["content"][0], {"type": "text", "text": "next"})
@@ -138,13 +159,17 @@ class TestPayloadTranslation(unittest.TestCase):
         ]
         tools = [{"name": "Bash"}, {"name": "Edit"}]
         base = anthropic_to_opencode_payload({"model": "opencode/big-pickle", "system": claude_code, "tools": tools, "messages": []})
-        sys_text = base["messages"][0]["content"]
+        blocks = system_blocks(base)
+        sys_text = blocks[0]
         self.assertIn("Do not chain shell commands", sys_text)
         self.assertIn("`old_string`", sys_text)
         self.assertNotIn("use the write tool", sys_text.lower())
         self.assertNotIn("billing", sys_text)
         self.assertNotIn("Claude Code", sys_text)
-        self.assertTrue(sys_text.endswith("Project rules from CLAUDE.md. Run via OpenCode."))
+        # The CLI agent block sits in between, so the client's own text is the last block, not a tail
+        # of the opencode prompt.
+        self.assertTrue(blocks[1].startswith("You are the coding agent"))
+        self.assertTrue(blocks[-1].endswith("Project rules from CLAUDE.md. Run via OpenCode."))
 
         kimi = anthropic_to_opencode_payload({"model": "opencode/kimi-k2", "messages": []})["messages"][0]["content"]
         self.assertTrue(kimi.startswith("You are opencode, an interactive general AI agent")
@@ -157,7 +182,7 @@ class TestPayloadTranslation(unittest.TestCase):
     def test_every_override_prompt_template_carries_the_guidance_placeholder(self):
         """Without the placeholder render_prompt is a no-op and shell/write/edit guidance vanishes."""
         for model in ("opencode/kimi-k2", "opencode/trinity", "opencode/muse-spark", "opencode/gpt-astra"):
-            prompt = build_opencode_system(model, None, ["Bash", "Edit"])
+            prompt = build_opencode_system(model, None, ["Bash", "Edit"])[0]
             self.assertNotIn(TOOL_GUIDANCE_PLACEHOLDER, prompt, model)
             self.assertIn("Do not chain shell commands", prompt, model)
             self.assertIn("`old_string`", prompt, model)
@@ -168,7 +193,7 @@ class TestPayloadTranslation(unittest.TestCase):
         c = {"messages": [{"role": "user", "content": "other"}]}
         self.assertEqual(conversation_session_id(a), conversation_session_id(b))
         self.assertNotEqual(conversation_session_id(a), conversation_session_id(c))
-        self.assertRegex(conversation_session_id(a), r"^ses_[0-9a-f]{64}$")
+        self.assertRegex(conversation_session_id(a), r"^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$")
 
     def test_session_id_follows_the_claude_code_session_not_the_device(self):
         def request(device, session):
@@ -195,9 +220,87 @@ class TestZenModelId(unittest.TestCase):
         self.assertTrue(payload["messages"][0]["content"].startswith("You are OpenCode, an interactive general AI agent"))
 
 
+class TestClaudeCliAgentBlock(unittest.TestCase):
+    """The second system block: what harness the model is driven by and which tools it has."""
+
+    def _blocks(self, tool_names, system=None):
+        return system_blocks(anthropic_to_opencode_payload(
+            {"model": "space-bunny-free", "system": system, "tools": [{"name": n} for n in tool_names],
+             "messages": []}))
+
+    def test_blocks_are_separate_messages_in_order(self):
+        blocks = self._blocks(["Bash"], system="Project rules")
+        self.assertEqual(len(blocks), 3)
+        self.assertTrue(blocks[0].startswith("You are an AI agent running in OpenCode"))
+        self.assertTrue(blocks[1].startswith("You are the coding agent"))
+        self.assertEqual(blocks[2], "Project rules")
+
+    def test_the_client_instructions_block_is_dropped_when_absent(self):
+        self.assertEqual(len(self._blocks(["Bash"])), 2)
+
+    def test_no_block_carries_the_antigravity_identity(self):
+        """Zen must see the opencode client, never the Cloud Code persona."""
+        blob = "\n".join(self._blocks(["Bash"], system="CLAUDE.md rules"))
+        self.assertNotIn("Antigravity", blob)
+        self.assertNotIn("DeepMind", blob)
+        self.assertNotIn("Claude Code", blob)
+        self.assertNotIn("Anthropic", blob)
+
+    def test_only_the_tools_of_the_request_are_described(self):
+        cli_block = self._blocks(["Bash", "Read"])[1]
+        self.assertIn("**Bash**:", cli_block)
+        self.assertIn("**Read**:", cli_block)
+        self.assertNotIn("**Edit**", cli_block)
+        self.assertNotIn("**WebSearch**", cli_block)
+        self.assertNotIn(CLAUDE_CLI_TOOL_GUIDANCE_PLACEHOLDER, cli_block)
+
+    def test_a_tool_outside_the_catalog_gets_no_prose_line(self):
+        """MCP tools reach the model through payload["tools"]; the prose block must not invent them."""
+        cli_block = self._blocks(["mcp__linear__create_issue"])[1]
+        self.assertNotIn("mcp__linear", cli_block)
+        self.assertNotIn(CLAUDE_CLI_TOOL_GUIDANCE_PLACEHOLDER, cli_block)
+        # The heading goes with it, so no empty section is left behind.
+        self.assertNotIn("# Tools available in this session", cli_block)
+
+    def test_the_catalog_covers_the_whole_cli_toolset(self):
+        """The tool set of the CLI agent as it reaches the proxy; a renamed tool has to fail here
+        rather than silently disappear from the prompt."""
+        from transformer.opencode_prompts import _CLI_TOOLS
+        expected = {
+            "Read", "Write", "Edit", "NotebookEdit", "Glob", "Grep", "Bash", "WebSearch", "WebFetch",
+            "Agent", "Skill", "SendMessage", "ListAgents", "TaskCreate", "TaskUpdate", "TaskGet",
+            "TaskList", "TaskStop", "Workflow", "ScheduleWakeup", "CronCreate", "CronDelete", "CronList",
+            "AskUserQuestion", "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree",
+            "DesignSync", "ReportFindings",
+        }
+        self.assertEqual(set(_CLI_TOOLS), expected)
+
+    def test_every_client_tool_reaches_zen_unfiltered(self):
+        """Tools are the model's whole reach; dropping one would silently shrink it."""
+        names = ["Read", "Write", "Edit", "Bash", "WebFetch", "AskUserQuestion", "mcp__x__y"]
+        schemas = [{"name": n, "description": f"d-{n}", "input_schema": {"type": "object", "properties": {}}}
+                   for n in names]
+        payload = anthropic_to_opencode_payload({"model": "m", "messages": [], "tools": schemas})
+        self.assertEqual([t["function"]["name"] for t in payload["tools"]], names)
+        self.assertEqual([t["function"]["parameters"] for t in payload["tools"]],
+                         [t["input_schema"] for t in schemas])
+        self.assertEqual([t["function"]["description"] for t in payload["tools"]],
+                         [t["description"] for t in schemas])
+
+    def test_merge_flag_folds_the_blocks_into_one_system_message(self):
+        with patch("backend.opencode.OPENCODE_MERGE_SYSTEM_BLOCKS", True):
+            payload = anthropic_to_opencode_payload(
+                {"model": "m", "system": "Project rules", "tools": [{"name": "Bash"}], "messages": []})
+        blocks = system_blocks(payload)
+        self.assertEqual(len(blocks), 1)
+        self.assertTrue(blocks[0].startswith("You are an AI agent running in OpenCode"))
+        self.assertIn("You are the coding agent", blocks[0])
+        self.assertTrue(blocks[0].endswith("Project rules"))
+
+
 class TestSystemTurnLowering(unittest.TestCase):
     def _payload(self, messages):
-        return anthropic_to_opencode_payload({"model": "m", "messages": messages})["messages"][1:]
+        return conversation_turns(anthropic_to_opencode_payload({"model": "m", "messages": messages}))
 
     def test_mid_conversation_system_turn_becomes_a_system_update_user_message(self):
         msgs = self._payload([
@@ -278,9 +381,9 @@ class TestSystemTurnLowering(unittest.TestCase):
         """Claude Code also appends the budget counter to its main system block."""
         head = [{"type": "text", "text":
                  "You are an agent working with the user.\n\n<total_tokens>15000000 tokens left</total_tokens>"}]
-        prompt = anthropic_to_opencode_payload({"model": "m", "system": head, "messages": []})["messages"][0]["content"]
-        self.assertIn("working with the user", prompt)
-        self.assertNotIn("total_tokens", prompt)
+        blocks = system_blocks(anthropic_to_opencode_payload({"model": "m", "system": head, "messages": []}))
+        self.assertIn("working with the user", blocks[-1])
+        self.assertNotIn("total_tokens", blocks[-1])
 
     def test_system_update_never_splits_an_assistant_tool_call_from_its_results(self):
         msgs = self._payload([
@@ -295,17 +398,17 @@ class TestSystemTurnLowering(unittest.TestCase):
 
 class TestToolAndEffortFields(unittest.TestCase):
     def test_tool_result_error_flag_is_preserved(self):
-        msgs = anthropic_to_opencode_payload({"model": "m", "messages": [
+        msgs = conversation_turns(anthropic_to_opencode_payload({"model": "m", "messages": [
             {"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "t1", "is_error": True, "content": "no such file"}]},
-        ]})["messages"][1:]
+        ]}))
         self.assertEqual(msgs[0]["content"], "Error: no such file")
 
     def test_successful_tool_result_is_not_marked(self):
-        msgs = anthropic_to_opencode_payload({"model": "m", "messages": [
+        msgs = conversation_turns(anthropic_to_opencode_payload({"model": "m", "messages": [
             {"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "t1", "content": "fine"}]},
-        ]})["messages"][1:]
+        ]}))
         self.assertEqual(msgs[0]["content"], "fine")
 
     def test_tools_carry_strict_false(self):
@@ -396,7 +499,9 @@ class TestOpenCodeStream(unittest.IsolatedAsyncioTestCase):
         _, body, headers = session.sent[0]
         self.assertTrue(body["stream_options"]["include_usage"])
         self.assertEqual(headers["x-opencode-client"], "opencode")
-        self.assertRegex(headers["User-Agent"], r"^opencode/[^/]+/[^/]+/[^/]+$")
+        # What the installed client sends: opencode/<version> plus the AI SDK's own half.
+        self.assertRegex(headers["User-Agent"],
+                         r"^opencode/\S+ ai-sdk/provider-utils/\S+ runtime/\S+$")
         self.assertTrue(headers["User-Agent"].startswith("opencode/"))
 
     async def test_every_block_is_opened_once_with_its_real_type(self):
@@ -526,6 +631,95 @@ class TestOpenCodeStream(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["max_completion_tokens"], 8192)
         self.assertEqual(headers["x-opencode-org-id"], "org_1")
 
+    async def test_free_model_runs_anonymously_with_the_public_token(self):
+        """No account at all: the free models go out as `Bearer public`, exactly like the opencode
+        client sends them, and the pool is never consulted."""
+        session = FakeSession([FakeResponse(200, sse_lines([{"choices": [{"delta": {"content": "ok"}}],
+                                                            "finish_reason": "stop"}]))])
+        tm = make_token_manager([])
+        client = OpenCodeClient(tm, http_session=session)
+        client._catalog = {"base_url": "https://zen.test", "headers": {},
+                           "models": {"space-bunny-free": {"name": "Space Bunny", "free": True, "output": 8192}},
+                           "source": "models"}
+        status, message = await fold_sse_to_message(client.generate_stream(
+            {"model": "space-bunny-free", "messages": [{"role": "user", "content": "hi"}],
+             "tools": [{"name": "Bash", "description": "run a command"},
+                       {"name": "Read", "description": "read a file"}]}))
+        self.assertEqual(status, 200)
+        self.assertEqual(message["content"][0]["text"], "ok")
+        _, body, headers = session.sent[0]
+        self.assertEqual(headers["Authorization"], "Bearer public")
+        # The free-tier gate only admits a streamed request, so stream must never be dropped here.
+        self.assertIs(body["stream"], True)
+        # Third condition of the gate: the names the opencode client uses have to be advertised. They are
+        # added as reserved copies, so Claude Code's own tools go out exactly as it wrote them.
+        self.assertEqual([t["function"]["name"] for t in body["tools"]], ["Bash", "Read", "bash", "read"])
+        self.assertEqual(body["tools"][0]["function"]["description"], "run a command")
+        self.assertIn("Do not call this tool directly", body["tools"][2]["function"]["description"])
+        self.assertRegex(headers["x-opencode-session"], r"^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$")
+        self.assertRegex(headers["x-opencode-request"], r"^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$")
+        # One id for the whole request: the cache key and the affinity key must not disagree.
+        self.assertEqual(headers["x-opencode-session-id"], headers["x-opencode-session"])
+        self.assertEqual(headers["x-session-affinity"], headers["x-opencode-session"])
+        self.assertEqual(headers["X-Session-Id"], headers["x-opencode-session"])
+        tm.get_token_for_account.assert_not_called()
+
+    async def test_a_call_to_a_reserved_name_is_routed_to_the_harness_tool(self):
+        """The marker says not to call it. If the model calls it anyway, the work still gets done."""
+        lines = [
+            {"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "c1", "function": {"name": "bash", "arguments": '{"command":"ls"}'}}]}}]},
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+        ]
+        session = FakeSession([FakeResponse(200, sse_lines(lines))])
+        client = OpenCodeClient(make_token_manager([]), http_session=session)
+        client._catalog = {"base_url": "https://zen.test", "headers": {},
+                           "models": {"space-bunny-free": {"name": "Space Bunny", "free": True, "output": 8192}},
+                           "source": "models"}
+        status, message = await fold_sse_to_message(client.generate_stream(
+            {"model": "space-bunny-free", "messages": [{"role": "user", "content": "list"}],
+             "tools": [{"name": "Bash"}]}))
+        self.assertEqual(status, 200)
+        self.assertEqual(message["content"][0], {"type": "tool_use", "id": "c1", "name": "Bash",
+                                                 "input": {"command": "ls"}})
+        self.assertEqual(message["stop_reason"], "tool_use")
+
+    async def test_a_credentialed_turn_sends_no_reserved_names(self):
+        lines = [
+            {"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "c1", "function": {"name": "Bash", "arguments": "{}"}}]}}]},
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+        ]
+        session = FakeSession([FakeResponse(200, sse_lines(lines))])
+        client = OpenCodeClient(make_token_manager([{"email": "a@b"}]), http_session=session)
+        status, message = await fold_sse_to_message(client.generate_stream(
+            {"model": "m", "messages": [{"role": "user", "content": "x"}], "tools": [{"name": "Bash"}]}))
+        self.assertEqual(status, 200)
+        self.assertEqual(message["content"][0]["name"], "Bash")
+        # With a credential the free tier is not in play, so nothing is added to the client's set.
+        self.assertEqual([t["function"]["name"] for t in session.sent[0][1]["tools"]], ["Bash"])
+
+    async def test_paid_model_without_an_account_is_refused_before_any_request(self):
+        session = FakeSession()
+        client = OpenCodeClient(make_token_manager([]), http_session=session)
+        status, body = await fold_sse_to_message(client.generate_stream(
+            {"model": "opencode/claude-sonnet-4-6", "messages": []}))
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"]["type"], "permission_error")
+        self.assertEqual(session.sent, [])
+
+    async def test_anonymous_refusal_explains_how_to_unblock_it(self):
+        session = FakeSession([FakeResponse(403, body='{"type":"error","error":{"type":"FreeTierError",'
+                                                          '"message":"free tier only from within OpenCode"}}')])
+        tm = make_token_manager([])
+        client = OpenCodeClient(tm, http_session=session)
+        status, body = await fold_sse_to_message(client.generate_stream(
+            {"model": "space-bunny-free", "messages": [], "tools": [{"name": "Bash"}]}))
+        self.assertEqual(status, 403)
+        self.assertIn("cli_auth.py login --provider opencode", body["error"]["message"])
+        # The anonymous turn has no account to cool down, so the pool must stay untouched.
+        tm.mark_account_cooldown.assert_not_called()
+
     async def test_rate_limit_fails_over_to_the_next_account(self):
         session = FakeSession([
             FakeResponse(429, body="slow down"),
@@ -558,12 +752,15 @@ class TestOpenCodeStream(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["error"]["type"], "rate_limit_error")
         self.assertIn("retry in", body["error"]["message"])
 
-    async def test_empty_pool_reports_an_auth_error(self):
+    async def test_empty_pool_reports_a_paid_model_needing_a_key(self):
+        """Model "m" is neither free nor in the pool: only an API key can reach a paid model."""
         tm = make_token_manager([], cooldown=0.0)
         client = OpenCodeClient(tm, http_session=FakeSession())
         status, body = await fold_sse_to_message(client.generate_stream({"model": "m", "messages": []}))
-        self.assertEqual(status, 401)
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"]["type"], "permission_error")
         self.assertIn("cli_auth.py login --provider opencode", body["error"]["message"])
+        self.assertIn("Free models work without one", body["error"]["message"])
 
     async def test_owned_session_is_closed_after_the_stream(self):
         session = FakeSession([FakeResponse(200, sse_lines([{"choices": [{"delta": {"content": "x"}}]}]))])
@@ -589,7 +786,7 @@ class TestOpenCodeRoutingIntegration(AioHTTPTestCase):
     HEADERS = {"Authorization": "Bearer t"}
 
     def _stub_client(self, *chunks):
-        async def generate_stream(body, headers=None):
+        async def generate_stream(body, headers=None, req_id=None):
             for chunk in chunks:
                 yield chunk
 

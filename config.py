@@ -79,6 +79,10 @@ OPENCODE_PROJECT_ID = os.environ.get("OPENCODE_PROJECT_ID", "global")
 OPENCODE_CLIENT_NAME = os.environ.get("OPENCODE_CLIENT_NAME", "opencode")
 # Free-tier models are the point of the Zen account, so they are what the access check probes.
 OPENCODE_PROBE_MODEL = os.environ.get("OPENCODE_PROBE_MODEL", "space-bunny-free")
+# Zen normally receives three system messages (opencode's own prompt, the CLI agent prompt, the
+# client's instructions). Chat Completions only guarantees one leading system turn, so a gateway that
+# refuses the others can be served by folding all three into a single system message instead.
+OPENCODE_MERGE_SYSTEM_BLOCKS = os.environ.get("OPENCODE_MERGE_SYSTEM_BLOCKS", "0").lower() in ("1", "true")
 
 
 DEFAULT_FALLBACK_PROJECT_ID = os.environ.get("PROXY_FALLBACK_PROJECT_ID", "rising-fact-p41fc")

@@ -32,7 +32,9 @@ claude-gemini-proxy\
 │   ├── content.py            # Anthropic -> Google request conversion (messages, roles, merging)
 │   ├── schema.py             # Protobuf schema sanitizer for Cloud Code's strict validation
 │   ├── prompts.py            # Antigravity system-prompt construction and identity scrubbing
-│   ├── opencode_prompts.py   # opencode system-prompt selection/rendering per model
+│   ├── opencode_prompts.py   # Zen system blocks: opencode's own prompt, CLI agent prompt, client text
+│   ├── opencode_ids.py       # Zen session/message ids in opencode's format (free-tier gate)
+│   ├── opencode_tool_alias.py# The tool names the free tier wants, added as reserved copies
 │   ├── signatures.py         # Thought-signature / tool-name / tool-args caches
 │   ├── streamer.py           # Google SSE <-> Anthropic SSE streaming conversion
 │   ├── search.py             # Web search fallback + Google search grounding formatting
@@ -40,7 +42,8 @@ claude-gemini-proxy\
 │   └── embeddings.py         # Embeddings handling
 │
 ├── prompts/                  # System prompt templates (see prompts/README.md)
-│   └── opencode/             # System prompts ported from the opencode app
+│   ├── opencode/             # System prompts ported from the opencode app
+│   └── claude_cli_agent.md   # Our Zen prompt: CLI agent harness + the tools of the request
 │
 ├── logs/                     # Detailed request logs (req_*.json) and proxy.log
 ├── dashboard.html            # Local web dashboard
@@ -135,7 +138,37 @@ prefix because that is what the client sends; Zen only ever receives the bare id
 | `opencode/nemotron-3.5-lightning-free` | `nemotron-3.5-lightning-free` | Zen |
 | `opencode/union-alpha` | `union-alpha` | Zen |
 
-Authentication is a Console device-code login (`python cli_auth.py login --provider opencode`) or a
+**Free tier: no account is required** (measured against the live gateway on 2026-10-14). With an empty
+OpenCode pool the proxy sends `Authorization: Bearer public` — the literal token the opencode client
+uses when nobody is logged in (`packages/core/src/plugin/provider/opencode.ts` sets
+`provider.settings.apiKey = "public"` and switches every model with `cost.input > 0` off) — and
+advertises only the free models. Logging in is what adds the paid ones; a paid model requested with an
+empty pool is refused locally with `permission_error`, before any upstream call.
+
+The gateway admits an anonymous request only when **all** of these hold (each isolated by bisection
+against the live gateway on 2026-10-14):
+- `stream: true` — a non-streamed turn gets `403 FreeTierError`;
+- tools advertised under the names opencode uses — `bash` + `read` is the smallest set that passes,
+  and one of the two alone is not enough. The check is on **names only**: the same 30 Claude Code
+  tools were refused with `Bash`/`Read` and served with two extra entries named `bash`/`read` carrying
+  an empty schema and a "do not call this" description; extra tools are ignored and descriptions are
+  ignored. `transformer/opencode_tool_alias.py` therefore *adds* two reserved copies of `Bash` and
+  `Read` rather than renaming anything — the client's own tools, schemas and prompt keep Claude Code's
+  names, and `_relay` routes a call that lands on a reserved name to the tool the harness runs, so a
+  model that ignored the note still gets its work done. With a credential none of it is sent.
+- an `x-opencode-session` in opencode's format — 12 hex characters of `~(Date.now() * 4096 + counter)`
+  plus 14 characters of the id alphabet (`packages/schema/src/identifier.ts`, ported in
+  `transformer/opencode_ids.py`). A random string is refused whatever its length; the gateway does not
+  look at how old the stamp is, so an id is minted once per conversation and reused, which is what
+  keeps `x-session-affinity` and the prompt cache stable.
+
+Everything else is irrelevant: `User-Agent` (now the same string the client sends,
+`opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14`), `x-opencode-project`,
+`tool_choice`, `stream_options` and the system prompt — opencode's prompt verbatim, alone or with the
+added CLI agent block and the real 30-tool set, makes no difference. A Console **API key** lifts the
+restriction and is the only way to reach paid models.
+
+**Authentication is a Console device login** (`python cli_auth.py login --provider opencode`) or a
 Console API key (`--api-key`), stored in the same `accounts.json` pool as the Google accounts but
 under a separate active pointer, so switching providers never disturbs the other.
 
@@ -147,17 +180,17 @@ everything else needs the `opencode/` prefix, because Zen also serves `claude-so
 `gemini-3.8-flash`, and those ids belong to Antigravity in this proxy.
 
 **Free tier** (verified live against the gateway on 2026-10-14): Zen answers
-`403 {"type":"FreeTierError"}` for every cost-0 model when the credential is a Console **session**
-token (`st_…`), regardless of endpoint, `User-Agent`, `x-opencode-*` headers, `x-opencode-org-id`,
-HTTP version, or system prompt. A paid model with the same token reaches the upstream provider
-(`402 Insufficient account funds`), so the token and endpoint are right - the gate is on the
-credential kind. The docs (https://opencode.ai/docs/zen) issue an **API key** for programmatic
-access and list the free models at $0 there, so the API key is the credential to use:
-`python cli_auth.py login --provider opencode --api-key <KEY>`, then
-`python cli_auth.py check --provider opencode` to verify with one real request.
+`403 {"type":"FreeTierError"}` for every cost-0 model whose request is not a streamed, tool-carrying
+turn of a session the opencode app itself owns, regardless of endpoint, `User-Agent`, `x-opencode-*`
+headers, `x-opencode-org-id`, HTTP version or system prompt. A Console **API key** is the credential
+that lifts it (`python cli_auth.py login --provider opencode --api-key <KEY>`, then
+`python cli_auth.py check --provider opencode` to verify with one real request), and it is required for
+paid models in any case. The docs (https://opencode.ai/docs/zen) issue the key for programmatic access
+and list the free models at $0 there.
 
 **Translation notes** (all mirrored from `anomalyco/opencode`, `packages/ai/src/protocols/openai-chat.ts`):
-- Only `messages[0]` may carry `role: "system"`. Claude Code interleaves system turns *between*
+- **Three leading system messages:** opencode's own prompt verbatim (so the gateway sees the same prefix it sees from the opencode client), then `prompts/claude_cli_agent.md` — the CLI agent harness with one line per tool the request carries, filled from `_CLI_TOOLS` in `transformer/opencode_prompts.py` — then the client's own instructions (CLAUDE.md, environment). A tool outside the catalog (an MCP tool) gets no prose line; its schema still reaches the model through `payload["tools"]`. `OPENCODE_MERGE_SYSTEM_BLOCKS=1` folds the three into a single system message. The Antigravity identity is never sent to Zen — it belongs to the Cloud Code backend.
+- Only the *first* system message may be a system role; Claude Code interleaves system turns *between*
   every model turn; those become `<system-update>` user messages with XML-escaped text, merged into
   the preceding user turn when there is one. A bare mid-array `system` role is invalid for Chat
   Completions and also breaks prefix caching.
@@ -165,8 +198,10 @@ access and list the free models at $0 there, so the API key is the credential to
   it carries no instruction and would inject hundreds of noise messages. Real system updates
   (`<system-reminder>`, `# Environment`) are kept, with the bookkeeping stripped from them.
   Toggle via `DROP_TOKEN_ACCOUNTING` in `backend/opencode.py`.
-- Tools are sent with `strict: false`, `max_tokens` becomes `max_completion_tokens`,
-  `stream_options.include_usage` is always on, and `output_config.effort` becomes `reasoning_effort`.
+- Tools are sent with `strict: false` and forwarded unfiltered — the CLI agent only offers the tools
+  its harness runs, so dropping an "unknown" one would silently shrink what the model can do,
+  `max_tokens` becomes `max_completion_tokens`, `stream_options.include_usage` is always on, and
+  `output_config.effort` becomes `reasoning_effort`.
 - `tool_result.is_error` has no equivalent field in Chat Completions, so it is marked in the text.
 
 ---
@@ -218,6 +253,7 @@ access and list the free models at $0 there, so the API key is the credential to
 ---
 
 8. **OpenCode Zen Emulation Fidelity:**
+   - **System blocks:** the request opens with three system messages — opencode's own prompt verbatim, `prompts/claude_cli_agent.md` (harness + the tools of that request, rendered from `_CLI_TOOLS`), and the client's own instructions. Block 1 stays byte-identical to upstream so the gateway's prefix cache still hits; block 2 moves only when the client's tool set does. Nothing here carries the Antigravity identity, and the Claude Code identity line is rewritten to OpenCode.
    - **Mid-conversation `system` turns:** Claude Code injects `role: "system"` messages between every model turn (295 of them in a 884-message session, mostly `<total_tokens>` bookkeeping). Chat Completions only allows `system` at index 0, so they are lowered to `<system-update>` user messages with XML escaping, matching opencode's own `lowerMessages`. Buffering keeps them from splitting an assistant `tool_calls` turn from its `tool` replies.
    - **Provider prefix:** the `opencode/` namespace is stripped before the request leaves the proxy; Zen only knows bare model ids.
    - **Error mapping:** upstream HTTP status is mapped to the matching Anthropic error type, so a 400/401/403 from Zen no longer reaches the client disguised as a 500. Streaming errors are detected before the response head is committed, so the HTTP status is real rather than a blanket 200.
@@ -236,7 +272,7 @@ All unit & integration tests pass:
 ```bash
 python -m unittest discover -s tests
 ```
-- `tests/test_opencode_client.py`: payload translation, provider-prefix stripping, system-turn lowering and token-bookkeeping filtering, tool adjacency, `is_error`, `strict`, `reasoning_effort`, truncated tool JSON, thinking blocks, one-`content_block_start`-per-index, output-cap retry, error mapping, account failover, and session ownership.
+- `tests/test_opencode_client.py`: payload translation, the three system blocks (order, no Antigravity/Claude Code identity, tool list of the request, catalog coverage, merge flag), provider-prefix stripping, system-turn lowering and token-bookkeeping filtering, tool adjacency, unfiltered tool forwarding, `is_error`, `strict`, `reasoning_effort`, truncated tool JSON, thinking blocks, one-`content_block_start`-per-index, output-cap retry, error mapping, account failover, and session ownership.
 - `tests/test_server.py` (10 tests): verifies health, models resolution, auto-mode classifier stub, accounts REST endpoints, count_tokens, and web dashboard endpoints (/dashboard, /api/stats, /api/events).
 - `tests/test_opencode_catalog.py`: Console-config parsing, `/models` merging, source fallback, per-token caching, and the offline `peek`.
 - `tests/test_multi_account.py` (6 tests): verifies multi-account pool, active switching, removal, model cooldown tracking, round-robin rotation, and automated 429 failover.

@@ -479,6 +479,9 @@
                 </h2>
                 <span style="font-size: 0.85rem; color: var(--text-dim);" id="opencode-models">Models: -</span>
             </div>
+            <div style="font-size: 0.8rem; color: var(--text-dim); margin-bottom: 0.75rem;">
+                Outbound IPs (switch on 429): <span id="opencode-proxies">-</span>
+            </div>
             <div class="accounts-grid" id="opencode-container">
                 <div style="color: var(--text-muted); font-size: 0.9rem;">Loading accounts...</div>
             </div>
@@ -546,6 +549,10 @@
                     renderAccounts(accsData.accounts || []);
                     renderOpencodeAccounts(accsData.opencode_accounts || []);
                     document.getElementById('opencode-models').textContent = 'Models: ' + ((accsData.opencode_models || []).join(', ') || '-');
+                    document.getElementById('opencode-proxies').innerHTML = (accsData.proxies || []).map(p =>
+                        `<span style="margin-right: 1rem; color: ${p.cooldown ? 'var(--accent-red, #f87171)' : 'var(--text-dim)'};">` +
+                        `${p.current ? '● ' : ''}${escapeHtml(p.proxy)}${p.cooldown ? ' (rate limited ' + p.cooldown + 's)' : ''}</span>`
+                    ).join('') || '-';
                 }
 
                 // 3. Fetch Limits and Quotas
