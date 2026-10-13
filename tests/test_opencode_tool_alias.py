@@ -38,9 +38,15 @@ class TestFreeTierMarkers(unittest.TestCase):
         markers = free_tier_markers([wire_tool("bash"), wire_tool("Bash"), wire_tool("Read")])
         self.assertEqual([m["function"]["name"] for m in markers], ["read"])
 
-    def test_nothing_is_invented_when_the_client_has_no_such_tool(self):
-        """Without Bash there is nothing to copy, and the refusal is reported rather than papered over."""
-        self.assertEqual(free_tier_markers([wire_tool("Edit")]), [])
+    def test_a_request_without_those_tools_still_names_them(self):
+        """An auxiliary call carries no tools, and the gate only looks at the names.
+
+        The names are sent with an empty schema rather than dropped: the turn is refused outright
+        otherwise, which costs the session its title. The gap is still reported.
+        """
+        markers = free_tier_markers([wire_tool("Edit")])
+        self.assertEqual([m["function"]["name"] for m in markers], ["bash", "read"])
+        self.assertEqual(markers[0]["function"]["parameters"], {"type": "object", "properties": {}})
         self.assertEqual(missing_free_tier_tools([wire_tool("Edit")]), ["bash", "read"])
         self.assertEqual(missing_free_tier_tools([]), ["bash", "read"])
 
@@ -73,6 +79,12 @@ class TestPayloadMarkers(unittest.TestCase):
     def test_a_credentialed_payload_carries_no_markers(self):
         payload = anthropic_to_opencode_payload(self._req([tool("Bash"), tool("Read")]))
         self.assertEqual([t["function"]["name"] for t in payload["tools"]], ["Bash", "Read"])
+
+    def test_a_turn_with_no_tools_still_names_them(self):
+        """The turn the client sends for a title carries no tools, and the free tier refuses one
+        that does not name bash and read - so the names go out with an empty schema."""
+        payload = anthropic_to_opencode_payload(self._req([]), free_tier_markers_on_wire=True)
+        self.assertEqual(sorted(declared_tool_names(payload["tools"])), ["bash", "read"])
 
     def test_the_prompt_never_mentions_the_reserved_names(self):
         req = self._req([tool("Bash"), tool("Read")])

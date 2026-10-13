@@ -397,19 +397,57 @@ class TestSystemTurnLowering(unittest.TestCase):
 
 
 class TestToolAndEffortFields(unittest.TestCase):
+    @staticmethod
+    def _call_then_result(result_block, call_id="t1"):
+        """A tool_result always arrives after the turn that issued it; Zen rejects it on its own.
+
+        Every real transcript pairs the two (2778 of 2778 tool results in this project's sessions
+        have an issuing tool_use), so the fixture has to carry the call too.
+        """
+        return {"model": "m", "messages": [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": call_id, "name": "Read",
+                                               "input": {}}]},
+            {"role": "user", "content": [result_block]},
+        ]}
+
     def test_tool_result_error_flag_is_preserved(self):
-        msgs = conversation_turns(anthropic_to_opencode_payload({"model": "m", "messages": [
-            {"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "t1", "is_error": True, "content": "no such file"}]},
-        ]}))
-        self.assertEqual(msgs[0]["content"], "Error: no such file")
+        msgs = conversation_turns(anthropic_to_opencode_payload(self._call_then_result(
+            {"type": "tool_result", "tool_use_id": "t1", "is_error": True, "content": "no such file"})))
+        self.assertEqual(msgs[1]["content"], "Error: no such file")
 
     def test_successful_tool_result_is_not_marked(self):
+        msgs = conversation_turns(anthropic_to_opencode_payload(self._call_then_result(
+            {"type": "tool_result", "tool_use_id": "t1", "content": "fine"})))
+        self.assertEqual(msgs[1]["content"], "fine")
+
+    def test_a_result_with_no_issuing_call_is_dropped(self):
+        """An orphan would be a 400 from Zen, so it never goes out."""
         msgs = conversation_turns(anthropic_to_opencode_payload({"model": "m", "messages": [
             {"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "t1", "content": "fine"}]},
+                {"type": "tool_result", "tool_use_id": "t1", "content": "stale"}]},
         ]}))
-        self.assertEqual(msgs[0]["content"], "fine")
+        self.assertEqual([m for m in msgs if m["role"] == "tool"], [])
+
+    def test_a_long_tool_result_is_bounded_but_keeps_head_and_tail(self):
+        """Every result is replayed on every later turn, so an unbounded one costs the whole session."""
+        from config import TOOL_RESULT_MAX_CHARS
+
+        huge = "HEADMARKER\n" + ("x" * 50000) + "\nTAILMARKER"
+        msgs = conversation_turns(anthropic_to_opencode_payload(self._call_then_result(
+            {"type": "tool_result", "tool_use_id": "t1", "content": huge})))
+        text = msgs[1]["content"]
+        self.assertLess(len(text), len(huge))
+        self.assertIn("HEADMARKER", text)
+        self.assertIn("TAILMARKER", text)
+        self.assertIn("characters cut", text)
+
+    def test_a_result_within_the_limit_is_untouched(self):
+        from config import TOOL_RESULT_MAX_CHARS
+
+        small = "y" * (TOOL_RESULT_MAX_CHARS - 10)
+        msgs = conversation_turns(anthropic_to_opencode_payload(self._call_then_result(
+            {"type": "tool_result", "tool_use_id": "t1", "content": small})))
+        self.assertEqual(msgs[1]["content"], small)
 
     def test_tools_carry_strict_false(self):
         payload = anthropic_to_opencode_payload({

@@ -390,6 +390,166 @@ class TestServerEndpoints(AioHTTPTestCase):
                 mock_upstream_resp.close.assert_called_once()
 
     @unittest_run_loop
+    async def test_search_only_turn_is_answered_without_calling_the_model(self):
+        """Zen's free tier refuses a turn with no bash/read, so the search is run here instead.
+
+        The point of the test is that generate_stream is never reached: forwarding it is what
+        produced the 403 FreeTierError.
+        """
+        body = {
+            "model": "space-bunny-free",
+            "messages": [{"role": "user", "content": "what is the STE100 style guide"}],
+            "tools": [{"name": "WebSearch", "description": "Searches the web.",
+                       "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}}}],
+        }
+        results = [{"title": "STE100", "url": "https://example.org/ste100", "snippet": "plain language"}]
+        headers = {"Authorization": "Bearer secret_sandbox_token"}
+        with patch("server.perform_web_search", return_value=results) as search, \
+                patch.object(self.proxy.opencode_client, "generate_stream") as upstream:
+            resp = await self.client.post("/v1/messages", json=body, headers=headers)
+            self.assertEqual(resp.status, 200)
+            data = await resp.json()
+            self.assertIn("STE100", data["content"][0]["text"])
+            self.assertIn("https://example.org/ste100", data["content"][0]["text"])
+            search.assert_called_once()
+            self.assertEqual(search.call_args[0][0], "what is the STE100 style guide")
+            upstream.assert_not_called()
+
+    @unittest_run_loop
+    async def test_a_gemini_search_turn_reaches_its_own_grounding(self):
+        """The intercept is scoped to Zen: Gemini -search carries the googleSearch tool itself."""
+        body = {
+            "model": "gemini-3.8-search",
+            "messages": [{"role": "user", "content": "what is the STE100 style guide"}],
+            "tools": [{"name": "WebSearch", "description": "Searches the web.",
+                       "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}}}],
+        }
+        headers = {"Authorization": "Bearer secret_sandbox_token"}
+        with patch("server.perform_web_search") as search, \
+                patch.object(self.proxy, "get_backend_stream", new=AsyncMock()) as upstream:
+            upstream.return_value = (MagicMock(), "gemini-3.8-flash-tiered")
+            await self.client.post("/v1/messages", json=body, headers=headers)
+            search.assert_not_called()
+            upstream.assert_called_once()
+
+    @unittest_run_loop
+    async def test_the_search_query_comes_from_the_tool_call(self):
+        """Once the model has called the tool the query is in its tool_use input, not the prompt."""
+        body = {
+            "model": "space-bunny-free",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "research STE100 for the project"}]},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "WebSearch",
+                                                   "input": {"query": "STE100 style guide rules"}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "old"}]},
+            ],
+            "tools": [{"name": "WebSearch", "description": "Searches the web.",
+                       "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}}}],
+        }
+        headers = {"Authorization": "Bearer secret_sandbox_token"}
+        with patch("server.perform_web_search", return_value=[]) as search, \
+                patch.object(self.proxy.opencode_client, "generate_stream") as upstream:
+            await self.client.post("/v1/messages", json=body, headers=headers)
+            search.assert_called_once()
+            self.assertEqual(search.call_args[0][0], "STE100 style guide rules")
+            upstream.assert_not_called()
+
+    def test_the_search_query_handles_every_content_shape(self):
+        """The list-content branch is the one that broke once; each shape has its own answer."""
+        query_of = ProxyApp._search_query_from
+        # plain string
+        self.assertEqual(query_of({"messages": [{"role": "user", "content": "plain prompt"}]}),
+                         "plain prompt")
+        # list of text blocks: only text blocks count, never a tool_result's payload
+        self.assertEqual(query_of({"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "content": "stale output"},
+            {"type": "text", "text": "the real question"}]}]}), "the real question")
+        # a tool_use query wins over the prompt it was made from
+        self.assertEqual(query_of({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "research STE100"}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t1",
+                                               "input": {"query": "STE100 rules"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "old"}]}]}),
+            "STE100 rules")
+        # nothing to search for
+        self.assertEqual(query_of({"messages": []}), "")
+        # a pasted block is bounded, not sent whole as the query
+        self.assertLessEqual(len(query_of({"messages": [{"role": "user", "content": "x" * 5000}]})),
+                             500)
+
+    @unittest_run_loop
+    async def test_an_auxiliary_call_is_answered_by_its_own_session_model(self):
+        """Two sessions in flight: each one's titles come from its own model, not the last speaker."""
+        headers = {"Authorization": "Bearer secret_sandbox_token"}
+        tools = [{"name": "Bash", "description": "Runs a command.",
+                  "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}}]
+
+        async def answered(*_args, **_kwargs):
+            yield ('event: message_start\ndata: {"type": "message_start", "message": {"id": "m1", '
+                   '"type": "message", "role": "assistant", "model": "m", "content": [], '
+                   '"stop_reason": null, "stop_sequence": null, '
+                   '"usage": {"input_tokens": 1, "output_tokens": 0}}}\n\n')
+            yield ('event: message_delta\ndata: {"type": "message_delta", "delta": '
+                   '{"stop_reason": "end_turn", "stop_sequence": null}, "usage": {"output_tokens": 1}}\n\n')
+            yield 'event: message_stop\ndata: {"type": "message_stop"}\n\n'
+
+        seen = []
+
+        async def record(body, *_args, **_kwargs):
+            seen.append(body["model"])
+            async for chunk in answered():
+                yield chunk
+
+        with patch.object(self.proxy.opencode_client, "generate_stream", side_effect=record):
+            for session, model in (("sess-a", "space-bunny-free"), ("sess-b", "gemini-3.8-flash-tiered")):
+                await self.client.post("/v1/messages", json={
+                    "model": model, "messages": [{"role": "user", "content": "hi"}], "tools": tools,
+                    "stream": False}, headers={**headers, "x-claude-code-session-id": session})
+            # Session A asks for a title on the small model; it must be answered by session A's model.
+            await self.client.post("/v1/messages", headers={
+                **headers, "x-claude-code-session-id": "sess-a",
+                "x-claude-code-request-class": "auxiliary"}, json={
+                "model": "claude-sonnet-5", "messages": [{"role": "user", "content": "title please"}]})
+
+        self.assertEqual(seen[-1], "space-bunny-free")
+
+    @unittest_run_loop
+    async def test_a_turn_with_real_tools_is_still_forwarded(self):
+        """The intercept is search-only: a turn carrying Bash must reach the model as before."""
+        body = {
+            "model": "space-bunny-free",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "WebSearch", "description": "Searches the web.",
+                       "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}}},
+                      {"name": "Bash", "description": "Runs a command.",
+                       "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}}],
+        }
+
+        async def answered(*_args, **_kwargs):
+            yield ('event: message_start\ndata: {"type": "message_start", "message": {"id": "m1", '
+                   '"type": "message", "role": "assistant", "model": "space-bunny-free", '
+                   '"content": [], "stop_reason": null, "stop_sequence": null, '
+                   '"usage": {"input_tokens": 1, "output_tokens": 0}}}\n\n')
+            yield ('event: content_block_start\ndata: {"type": "content_block_start", "index": 0, '
+                   '"content_block": {"type": "text", "text": ""}}\n\n')
+            yield ('event: content_block_delta\ndata: {"type": "content_block_delta", "index": 0, '
+                   '"delta": {"type": "text_delta", "text": "hi"}}\n\n')
+            yield 'event: content_block_stop\ndata: {"type": "content_block_stop", "index": 0}\n\n'
+            yield ('event: message_delta\ndata: {"type": "message_delta", "delta": '
+                   '{"stop_reason": "end_turn", "stop_sequence": null}, '
+                   '"usage": {"output_tokens": 1}}\n\n')
+            yield 'event: message_stop\ndata: {"type": "message_stop"}\n\n'
+
+        with patch("server.perform_web_search") as search, \
+                patch.object(self.proxy.opencode_client, "generate_stream",
+                             side_effect=answered) as upstream:
+            resp = await self.client.post("/v1/messages", json=body,
+                                          headers={"Authorization": "Bearer secret_sandbox_token"})
+            self.assertEqual(resp.status, 200)
+            search.assert_not_called()
+            upstream.assert_called_once()
+
+    @unittest_run_loop
     async def test_opencode_model_relays_anthropic_sse(self):
         import json
         events = [
