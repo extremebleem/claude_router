@@ -21,8 +21,10 @@ class TestE2ESwitching(unittest.TestCase):
 
             # OpenCode Zen models
             self.assertIn("space-bunny-free", model_ids)
-            self.assertIn("opencode/space-bunny-free", model_ids)
             self.assertIn("opencode/nemotron-3-ultra-free", model_ids)
+            # The prefixed twin of space-bunny-free is redundant: both route identically and
+            # Zen receives the same bare id, so only one is advertised.
+            self.assertNotIn("opencode/space-bunny-free", model_ids)
 
         asyncio.run(run_test())
 

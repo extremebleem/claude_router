@@ -13,7 +13,7 @@ import secrets
 import re
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, AsyncGenerator
 from aiohttp import web, ClientSession
 from aiohttp.web_exceptions import HTTPRequestEntityTooLarge
 
@@ -31,7 +31,7 @@ from config import DEFAULT_FALLBACK_PROJECT_ID, SAVE_DETAILED_REQUEST_LOGS
 from auth.token_manager import TokenManager
 from auth.discovery import fetch_available_models
 from backend.antigravity import AntigravityClient, CloudCodeClient
-from backend.opencode import OpenCodeClient
+from backend.opencode import OpenCodeClient, fold_sse_to_message, OPENCODE_ERROR_STATUS
 from backend.router import ProviderRouter, OPENCODE_MODELS
 from backend.gemini_api import GeminiApiClient
 from transformer.signatures import signature_cache
@@ -48,6 +48,14 @@ def _format_wait_duration(seconds: float) -> str:
     if h > 0:
         return f"{h}h {m}m"
     return f"{m}m"
+
+
+async def _prepend_chunk(first: Optional[str], rest) -> AsyncGenerator[str, None]:
+    """Re-chains a peeked first chunk back onto the rest of an async generator."""
+    if first is not None:
+        yield first
+    async for chunk in rest:
+        yield chunk
 
 
 AVAILABLE_MODELS = [
@@ -241,6 +249,26 @@ class SuppressDisconnectFilter(logging.Filter):
         return True
 
 
+def merge_opencode_models(models: list, now: float) -> list:
+    """Appends the Zen models the router can dispatch to. The Zen catalogue is static, so it is
+    advertised on every path - including the ones where Google discovery failed, which is exactly
+    the state a Zen-only account is in."""
+    iso_time = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    for oc_model in OPENCODE_MODELS:
+        if not any(m["id"] == oc_model for m in models):
+            models.append({
+                "id": oc_model,
+                "type": "model",
+                "display_name": f"OpenCode {oc_model}",
+                "created_at": iso_time,
+                "object": "model",
+                "created": int(now),
+                "owned_by": "opencode",
+                "description": f"OpenCode {oc_model} (Zen Gateway)",
+            })
+    return models
+
+
 def _setup_aiohttp_logger_suppression():
     """Attaches filter to aiohttp.server logger to prevent terminal stderr pollution on disconnect."""
     server_logger = logging.getLogger("aiohttp.server")
@@ -317,6 +345,12 @@ class ProxyApp:
                     )
 
         return await handler(request)
+
+    def set_http_session(self, session: ClientSession):
+        """Hands the shared connection pool to the OpenCode client, which otherwise opens a session
+        (and a TLS handshake) for every single model turn."""
+        self.http_session = session
+        self.opencode_client.http_session = session
 
     def setup_routes(self):
         # Dashboard UI & Stats
@@ -617,18 +651,104 @@ class ProxyApp:
             log(f"[State Classifier Stub] [Req #{req_id}] ℹ Client disconnected / aborted request early.", level="DEBUG")
         return response
 
+    def opencode_accounts_info(self) -> list:
+        """OpenCode accounts for the dashboard/health: login kind, token expiry, active flag, cooldowns."""
+        tm = self.token_manager
+        active = tm.get_active_account(provider="opencode")
+        active_id = (active.get("email") or active.get("id")) if active else None
+        exhausted = tm.get_exhausted_status()
+        accounts = []
+        for acc in tm.get_accounts(provider="opencode"):
+            ident = acc.get("email") or acc.get("id")
+            accounts.append({
+                "email": ident,
+                "auth": "oauth" if acc.get("refresh_token") else "api_key",
+                "expires_at": acc.get("expires_at"),
+                "is_active": ident == active_id,
+                "cooldowns": exhausted.get(ident, {}),
+            })
+        return accounts
+
+    def record_event(self, req_id, model, account, stream, status, t_start, provider):
+        self.recent_events.insert(0, {
+            "time": time.strftime("%H:%M:%S"),
+            "req_id": req_id,
+            "model": model,
+            "account": account,
+            "provider": provider,
+            "stream": stream,
+            "status": status,
+            "latency": int((time.time() - t_start) * 1000),
+        })
+        if len(self.recent_events) > 50:
+            self.recent_events.pop()
+
+    async def handle_opencode_messages(self, request: web.Request, body: dict, stream: bool, req_id: str):
+        """OpenCodeClient already yields Anthropic SSE text, so it is relayed without the Google parser."""
+        model = body.get("model")
+        log(f"[Req #{req_id}] Routing model '{model}' to OpenCode Zen backend", level="INFO")
+        t_start = time.time()
+        active = self.token_manager.get_active_account(provider="opencode")
+        account = (active.get("email") or active.get("id")) if active else "no-account"
+        chunks = self.opencode_client.generate_stream(body)
+
+        # Peek the first chunk: an upstream failure arrives as a single leading error event, and
+        # reporting it as HTTP 200 makes the client treat a dead account as a healthy stream.
+        iterator = chunks.__aiter__()
+        first = None
+        try:
+            first = await anext(iterator)
+        except StopAsyncIteration:
+            pass
+
+        if first is not None and first.startswith("event: error"):
+            error_body = json.loads(first.split("data: ", 1)[1])
+            status = OPENCODE_ERROR_STATUS.get(error_body["error"].get("type"), 500)
+            await chunks.aclose()
+            self.record_event(req_id, model, account, stream, status, t_start, "opencode")
+            return web.json_response(error_body, status=status)
+
+        if not stream:
+            status, message = await fold_sse_to_message(_prepend_chunk(first, chunks))
+            self.record_event(req_id, model, account, False, status, t_start, "opencode")
+            return web.json_response(message, status=status)
+
+        outcome = {"status": 200}
+
+        async def relay():
+            if first is not None:
+                yield first
+            async for chunk in chunks:
+                if chunk.startswith("event: error"):
+                    kind = json.loads(chunk.split("data: ", 1)[1])["error"]["type"]
+                    outcome["status"] = OPENCODE_ERROR_STATUS.get(kind, 500)
+                yield chunk
+
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream; charset=utf-8",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            }
+        )
+        try:
+            await response.prepare(request)
+            async for chunk in relay():
+                await response.write(chunk.encode("utf-8"))
+            await response.write_eof()
+        except CLIENT_DISCONNECT_ERRORS:
+            log(f"[Req #{req_id}] ℹ Client disconnected / aborted request early.", level="DEBUG")
+        finally:
+            self.record_event(req_id, model, account, True, outcome["status"], t_start, "opencode")
+        return response
+
     async def get_backend_stream(self, body: dict, req_id: Optional[str] = None):
         """
-        Dispatches request via ProviderRouter to Antigravity (Google CloudCode) or OpenCode Zen.
+        Dispatches request to Antigravity (Google CloudCode).
         If Antigravity is exhausted and Gemini API key is configured, falls back to Google AI Studio.
         """
-        model_name = body.get("model", "")
-        provider = self.router.resolve_provider(model_name)
-
-        if provider == "opencode":
-            log(f"[Req #{req_id}] Routing model '{model_name}' to OpenCode Zen backend", level="INFO")
-            return self.opencode_client.generate_stream(body)
-
         gemini_key = self.token_manager.get_gemini_api_key()
 
         try:
@@ -724,6 +844,9 @@ class ProxyApp:
             if len(self.recent_events) > 50:
                 self.recent_events.pop()
             return await self.handle_classifier_stub(request, raw_model, stream, req_id, dangerous_match=dangerous_cmd)
+
+        if self.router.resolve_provider(model) == "opencode":
+            return await self.handle_opencode_messages(request, body, stream, req_id)
 
         try:
             upstream_resp, original_model = await self.get_backend_stream(body, req_id=req_id)
@@ -828,20 +951,7 @@ class ProxyApp:
             token, project_id = None, None
 
         if not token:
-            results = list(AVAILABLE_MODELS)
-            for oc_model in OPENCODE_MODELS:
-                if not any(m["id"] == oc_model for m in results):
-                    results.append({
-                        "id": oc_model,
-                        "type": "model",
-                        "display_name": f"OpenCode {oc_model}",
-                        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
-                        "object": "model",
-                        "created": int(now),
-                        "owned_by": "opencode",
-                        "description": f"OpenCode {oc_model} (Zen Gateway)",
-                    })
-            return results
+            return merge_opencode_models(list(AVAILABLE_MODELS), now)
 
         try:
             loop = asyncio.get_running_loop()
@@ -899,25 +1009,16 @@ class ProxyApp:
 
                 if results:
                     # Append OpenCode Zen models to dynamic model list
-                    for oc_model in OPENCODE_MODELS:
-                        if not any(m["id"] == oc_model for m in results):
-                            results.append({
-                                "id": oc_model,
-                                "type": "model",
-                                "display_name": f"OpenCode {oc_model}",
-                                "created_at": iso_time,
-                                "object": "model",
-                                "created": int(now),
-                                "owned_by": "opencode",
-                                "description": f"OpenCode {oc_model} (Zen Gateway)",
-                            })
+                    merge_opencode_models(results, now)
                     self._models_cache = results
                     self._models_cache_time = now
                     return results
         except Exception as e:
             log(f"[Models] Error fetching dynamic models: {e}", level="WARN")
 
-        return AVAILABLE_MODELS
+        # Discovery failed: the static catalogue still has to advertise Zen, or a Zen-only account
+        # would see an empty model list and no way to pick one.
+        return merge_opencode_models(list(AVAILABLE_MODELS), now)
 
     async def handle_models(self, request: web.Request):
         models = await self.get_dynamic_models()
@@ -975,15 +1076,18 @@ class ProxyApp:
     async def handle_api_stats(self, request: web.Request):
         """Returns proxy server aggregate metrics."""
         account = self.token_manager.get_active_account()
-        accounts = self.token_manager.get_accounts()
+        accounts = self.token_manager.get_accounts(provider="google")
         email = account.get("email") if account else "None"
         tier = account.get("tier", "unknown") if account else "unknown"
         gemini_key = bool(self.token_manager.get_gemini_api_key())
+        opencode = self.opencode_accounts_info()
         return web.json_response({
             "total_requests": self.total_requests,
             "active_account": email,
             "tier": tier,
             "total_accounts": len(accounts),
+            "opencode_accounts": len(opencode),
+            "active_opencode_account": next((a["email"] for a in opencode if a["is_active"]), None),
             "direct_gemini_api": gemini_key,
             "uptime_seconds": int(time.time() - self._start_time) if hasattr(self, "_start_time") else 0
         })
@@ -997,17 +1101,20 @@ class ProxyApp:
 
     async def handle_health(self, request: web.Request):
         account = self.token_manager.get_active_account()
-        accounts = self.token_manager.get_accounts()
+        accounts = self.token_manager.get_accounts(provider="google")
         email = account.get("email") if account else "None"
         tier = account.get("tier", "unknown") if account else "unknown"
         project_id = account.get("project_id") if account else None
         gemini_key = bool(self.token_manager.get_gemini_api_key())
+        opencode = self.opencode_accounts_info()
         return web.json_response({
             "status": "healthy",
             "active_account": email,
             "tier": tier,
             "project_id": project_id,
             "total_accounts": len(accounts),
+            "opencode_accounts": len(opencode),
+            "active_opencode_account": next((a["email"] for a in opencode if a["is_active"]), None),
             "direct_gemini_api": gemini_key,
             "sandbox_secured": bool(self.session_auth_token)
         })
@@ -1030,7 +1137,7 @@ class ProxyApp:
 
     async def handle_accounts_list(self, request: web.Request):
         """Returns JSON list of stored accounts with active status and cooldowns."""
-        accounts = self.token_manager.get_accounts()
+        accounts = self.token_manager.get_accounts(provider="google")
         active = self.token_manager.get_active_account()
         active_email = active.get("email") if active else None
         exhausted = self.token_manager.get_exhausted_status()
@@ -1049,6 +1156,8 @@ class ProxyApp:
             "accounts": data,
             "total": len(data),
             "active_email": active_email,
+            "opencode_accounts": self.opencode_accounts_info(),
+            "opencode_models": OPENCODE_MODELS,
             "gemini_api_key_configured": bool(self.token_manager.get_gemini_api_key())
         })
 
@@ -1075,7 +1184,8 @@ class ProxyApp:
         format_param = request.query.get("format", "json").lower()
         loop = asyncio.get_running_loop()
 
-        accounts = self.token_manager.get_accounts()
+        # Quotas come from Google Cloud Code; never send other providers' tokens there
+        accounts = self.token_manager.get_accounts(provider="google")
         if not accounts:
             active = self.token_manager.get_active_account()
             if active:
@@ -1245,7 +1355,7 @@ async def run_server(host: str = "127.0.0.1", port: int = 8080, session_auth_tok
     proxy = ProxyApp(token_manager, session_auth_token=session_auth_token)
 
     async with ClientSession() as session:
-        proxy.http_session = session
+        proxy.set_http_session(session)
         runner = web.AppRunner(proxy.app)
         await runner.setup()
         site = web.TCPSite(runner, host, port)

@@ -61,6 +61,18 @@ class TestServerEndpoints(AioHTTPTestCase):
 
 
     @unittest_run_loop
+    async def test_zen_models_are_listed_when_google_discovery_fails(self):
+        """A Zen-only account has no Google token; the catalogue must still offer the free models."""
+        headers = {"Authorization": "Bearer secret_sandbox_token"}
+        with patch("server.fetch_available_models", side_effect=RuntimeError("no cloud code access")):
+            self.proxy._models_cache = None
+            resp = await self.client.get("/v1/models", headers=headers)
+        self.assertEqual(resp.status, 200)
+        model_ids = [m["id"] for m in (await resp.json())["data"]]
+        self.assertIn("space-bunny-free", model_ids)
+        self.assertIn("opencode/nemotron-3-ultra-free", model_ids)
+
+    @unittest_run_loop
     async def test_count_tokens(self):
         headers = {"Authorization": "Bearer secret_sandbox_token"}
         payload = {"messages": [{"role": "user", "content": "Hello world from test!"}]}
@@ -346,6 +358,37 @@ class TestServerEndpoints(AioHTTPTestCase):
                 resp = await self.proxy.handle_messages(mock_request)
                 self.assertIsInstance(resp, web.StreamResponse)
                 mock_upstream_resp.close.assert_called_once()
+
+    @unittest_run_loop
+    async def test_opencode_model_relays_anthropic_sse(self):
+        import json
+        events = [
+            {"type": "message_start", "message": {"id": "m1", "type": "message", "role": "assistant",
+                                                  "model": "space-bunny-free", "content": [],
+                                                  "usage": {"input_tokens": 1, "output_tokens": 0}}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "При"}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "вет"}},
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 2}},
+        ]
+
+        def fake_stream(body):
+            async def gen():
+                for e in events:
+                    yield f"event: {e['type']}\ndata: {json.dumps(e)}\n\n"
+            return gen()
+
+        headers = {"Authorization": "Bearer secret_sandbox_token"}
+        body = {"model": "space-bunny-free", "messages": [{"role": "user", "content": "привет"}]}
+        with patch.object(self.proxy.opencode_client, "generate_stream", side_effect=fake_stream):
+            resp = await self.client.post("/v1/messages", json={**body, "stream": True}, headers=headers)
+            self.assertEqual(resp.status, 200)
+            self.assertIn('"text": "\\u0432\\u0435\\u0442"', await resp.text())
+
+            resp = await self.client.post("/v1/messages", json=body, headers=headers)
+            self.assertEqual(resp.status, 200)
+            data = await resp.json()
+            self.assertEqual(data["content"], [{"type": "text", "text": "Привет"}])
+            self.assertEqual(data["stop_reason"], "end_turn")
 
 
 if __name__ == "__main__":
