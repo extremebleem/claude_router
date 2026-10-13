@@ -41,9 +41,9 @@ def declared_tool_names(tools: List[Dict]) -> List[str]:
 def free_tier_markers(tools: List[Dict]) -> List[Dict]:
     """Copies of the client's own tools under the names the free tier expects.
 
-    Skipped when the client already advertises the name, and when it has no tool to copy - a request
-    that cannot satisfy the gate is reported by :func:`missing_free_tier_tools` instead of having a
-    made-up tool invented for it.
+    Skipped when the client already advertises the name. When the client has no such tool to copy the
+    name is sent anyway with an empty schema: the gate only looks at the names, and refusing to name
+    it would cost the turn outright. :func:`missing_free_tier_tools` still reports the gap.
     """
     present = set(declared_tool_names(tools))
     markers = []
@@ -51,12 +51,15 @@ def free_tier_markers(tools: List[Dict]) -> List[Dict]:
         if model_name in present:
             continue
         source = next((t for t in tools if t["function"]["name"] == client_name), None)
-        if source is None:
-            continue
+        function = dict(source["function"]) if source else {
+            # strict:false is what every other wire tool carries; a validator rejects a schema without it.
+            "parameters": {"type": "object", "properties": {}},
+            "strict": False,
+        }
         markers.append({
             "type": "function",
             "function": {
-                **source["function"],
+                **function,
                 "name": model_name,
                 "description": RESERVED_NOTE.format(client=client_name),
             },

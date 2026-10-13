@@ -161,6 +161,8 @@ def model_prompt(model: str) -> tuple:
         return "trinity.txt", "override"
     if "muse" in m:
         return "meta.txt", "override"
+    if "bunny" in m:
+        return "space-bunny.txt", "append"
     return None
 
 
