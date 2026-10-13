@@ -196,7 +196,7 @@ class AntigravityClient:
         available_accounts = self.token_manager.get_available_accounts(model)
         if not available_accounts:
             # Check if there are any accounts at all
-            all_accs = self.token_manager.get_accounts()
+            all_accs = self.token_manager.get_accounts(provider="google")
             if not all_accs:
                 raise RuntimeError(
                     "No authorization token found. Run 'python cli_auth.py login' before starting."

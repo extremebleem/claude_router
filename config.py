@@ -62,6 +62,18 @@ ANTIGRAVITY_HEADERS = {
     "x-goog-api-client": "google-cloud-sdk vscode/1.96.0 gl-node/18.18.2"
 }
 
+# OpenCode Zen gateway.
+# The public catalog (models.dev) lists api = https://opencode.ai/inference/v1, but a signed-in
+# Console account is served its own endpoint by GET /console/api/config ("Personal / OpenCode"
+# provider), and that is the one the real CLI uses. Default to the Console form; override with
+# OPENCODE_ZEN_BASE_URL if the catalog endpoint is what your plan expects.
+OPENCODE_ZEN_BASE_URL = os.environ.get("OPENCODE_ZEN_BASE_URL", "https://opencode.ai/inference/openai/v1")
+# Sent as x-opencode-project. opencode sends the real session.projectID; there is no equivalent
+# in the Anthropic request, so this is the closest stable stand-in.
+OPENCODE_PROJECT_ID = os.environ.get("OPENCODE_PROJECT_ID", "global")
+# Sent as x-opencode-client (App.name in packages/core/src/app.ts).
+OPENCODE_CLIENT_NAME = os.environ.get("OPENCODE_CLIENT_NAME", "opencode")
+
 
 DEFAULT_FALLBACK_PROJECT_ID = os.environ.get("PROXY_FALLBACK_PROJECT_ID", "rising-fact-p41fc")
 
