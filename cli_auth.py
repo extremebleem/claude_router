@@ -19,6 +19,7 @@ import os
 import argparse
 import time
 from datetime import datetime
+from typing import Optional
 
 # Configure UTF-8 output on Windows consoles
 if hasattr(sys.stdout, "reconfigure"):
@@ -31,7 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from auth.token_manager import TokenManager
 from auth.discovery import fetch_available_models
-from backend.router import OPENCODE_MODELS
+from backend.router import opencode_model_ids
 
 
 def cmd_login(manager: TokenManager):
@@ -77,10 +78,16 @@ def print_opencode_section(manager: TokenManager):
     if not rows:
         print("✗ No OpenCode accounts. To log in: python cli_auth.py login --provider opencode")
         return
-    print(f"Models: {', '.join(OPENCODE_MODELS)}")
+    print(f"Models: {', '.join(opencode_model_ids())}")
     for i, (ident, is_active, kind, expiry, cooldown) in enumerate(rows, 1):
         print(f"{i}. {ident}{' [ACTIVE]' if is_active else ''}")
         print(f"   Auth: {kind} | {expiry}" + (f" | ⚠️ Cooldown ({cooldown})" if cooldown else ""))
+    # Worth saying up front: Zen serves its free models to the official client, and a Console
+    # session token is not that credential - the 403 otherwise arrives mid-conversation.
+    if any(kind == "Console login" for _, _, kind, _, _ in rows):
+        print("ℹ Free-tier models need a Console API key: "
+              "python cli_auth.py login --provider opencode --api-key <KEY>")
+        print("  Verify with: python cli_auth.py check --provider opencode")
 
 
 def cmd_status(manager: TokenManager):
@@ -244,15 +251,72 @@ def cmd_set_key(manager: TokenManager, key: str):
     print(f"✓ Direct Gemini API key successfully saved ({key[:8]}...)")
 
 
+def cmd_check_opencode(manager: TokenManager, model: Optional[str] = None):
+    """Probes Zen with the stored credential and says which of the failure modes it is.
+
+    Worth having as a command: a Console session token, an API key and an account with no funds
+    all reach the gateway differently, and only a real request tells them apart.
+    """
+    from auth.opencode_catalog import get_catalog, output_limit
+    from auth.opencode_oauth import probe_access
+    from backend.opencode import upstream_error_kind
+
+    accounts = manager.get_accounts(provider="opencode")
+    if not accounts:
+        print("✗ No OpenCode accounts. Run: python cli_auth.py login --provider opencode")
+        return
+    active = manager.get_active_account(provider="opencode") or accounts[0]
+    ident = active.get("email") or active.get("id")
+    token, _ = manager.get_token_for_account(active)
+    catalog = get_catalog(active.get("access_token"))
+    target = model or next((m for m, i in catalog["models"].items() if i.get("free")), None)
+    if not target:
+        print("✗ Zen returned no models to probe with.")
+        return
+
+    print(f"Account:  {ident}")
+    print(f"Endpoint: {catalog['base_url']}  (catalogue: {catalog['source']})")
+    print(f"Models:   {len(catalog['models'])} reachable, {sum(1 for i in catalog['models'].values() if i.get('free'))} free")
+    print(f"Probing:  {target} (output cap {output_limit(catalog, target) or '?'})")
+    result = probe_access(token, target, catalog["base_url"])
+    if result["ok"]:
+        print("✓ Works.")
+        return
+
+    status, body = result["status"], result["message"]
+    kind = upstream_error_kind(body) or ""
+    print(f"✗ HTTP {status} {kind}".rstrip())
+    if kind == "FreeTierError":
+        print("  Free-tier models are served only to the official OpenCode client.")
+        print("  Create an API key at https://opencode.ai/console and run:")
+        print("    python cli_auth.py login --provider opencode --api-key <KEY>")
+    elif kind == "RegionError":
+        print("  This model is not available in your region.")
+    elif kind == "ModelDeprecated":
+        print("  This model has been removed. Run 'python cli_auth.py pool' for the current list.")
+    elif status == 402 or "Insufficient account funds" in body:
+        print("  The account has no credits. Free models do not need any, so try one of those.")
+    elif status in (401, 403):
+        print("  The credential was rejected. Re-run the login for this provider.")
+    else:
+        print(f"  {body[:300]}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Authentication & Multi-Account Pool Manager for Claude-Gemini Proxy")
     subparsers = parser.add_subparsers(dest="command")
 
     p_login = subparsers.add_parser("login", help="Interactive OAuth login via browser")
     p_login.add_argument("--provider", choices=["google", "opencode"], default="google", help="Provider to login with (default: google)")
+    p_login.add_argument("--api-key", help="OpenCode Console API key (skips the device flow)")
 
     p_add = subparsers.add_parser("add", help="Add another account to pool")
     p_add.add_argument("--provider", choices=["google", "opencode"], default="google", help="Provider to add account for (default: google)")
+    p_add.add_argument("--api-key", help="OpenCode Console API key (skips the device flow)")
+
+    p_check = subparsers.add_parser("check", help="Probe a provider end-to-end and report what is reachable")
+    p_check.add_argument("--provider", choices=["google", "opencode"], default="opencode")
+    p_check.add_argument("--model", help="Model to probe (default: the first free one Zen advertises)")
 
     subparsers.add_parser("login-opencode", help="Login to OpenCode via device flow")
     subparsers.add_parser("status", help="Check active session status")
@@ -278,9 +342,14 @@ def main():
         if provider == "opencode":
             import asyncio
             from auth.opencode_oauth import login_opencode_flow
-            asyncio.run(login_opencode_flow(manager))
+            asyncio.run(login_opencode_flow(manager, getattr(args, "api_key", None)))
         else:
             cmd_login(manager)
+    elif args.command == "check":
+        if args.provider == "opencode":
+            cmd_check_opencode(manager, args.model)
+        else:
+            cmd_status(manager)
     elif args.command == "login-opencode":
         import asyncio
         from auth.opencode_oauth import login_opencode_flow

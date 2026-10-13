@@ -14,8 +14,22 @@ from backend.opencode import (
     is_token_accounting,
     zen_model_id,
 )
+from auth.opencode_catalog import static_snapshot
 from server import ProxyApp
 from transformer.opencode_prompts import TOOL_GUIDANCE_PLACEHOLDER, build_opencode_system
+
+_catalog_patcher = None
+
+
+def setUpModule():
+    """Keeps the suite offline: the real client fetches the Zen catalogue, which is network IO."""
+    global _catalog_patcher
+    _catalog_patcher = patch("backend.opencode.get_catalog", side_effect=lambda token=None, ua="": static_snapshot())
+    _catalog_patcher.start()
+
+
+def tearDownModule():
+    _catalog_patcher.stop()
 
 
 def sse_lines(chunks):
@@ -474,13 +488,43 @@ class TestOpenCodeStream(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(session.sent), 1)
 
     async def test_free_tier_gate_is_reported_as_a_permission_error(self):
+        """The gate is a policy refusal, not a broken credential: the message has to say what to do
+        and must not cool the account down."""
         session = FakeSession([FakeResponse(403, body='{"type":"FreeTierError"}')])
         tm = make_token_manager([{"email": "a@b"}])
         client = OpenCodeClient(tm, http_session=session)
         status, body = await fold_sse_to_message(client.generate_stream({"model": "m", "messages": []}))
         self.assertEqual(status, 403)
         self.assertEqual(body["error"]["type"], "permission_error")
-        self.assertIn("FreeTierError", body["error"]["message"])
+        self.assertIn("--api-key", body["error"]["message"])
+        tm.mark_account_cooldown.assert_not_called()
+
+    async def test_region_and_deprecation_refusals_are_not_credential_failures(self):
+        cases = [
+            (403, '{"type":"RegionError"}', "permission_error", "region"),
+            (410, '{"type":"ModelDeprecated"}', "not_found_error", "deprecated"),
+        ]
+        for http_status, body_text, kind, hint in cases:
+            tm = make_token_manager([{"email": "a@b"}])
+            client = OpenCodeClient(tm, http_session=FakeSession([FakeResponse(http_status, body=body_text)]))
+            status, body = await fold_sse_to_message(client.generate_stream({"model": "m", "messages": []}))
+            self.assertEqual(body["error"]["type"], kind)
+            self.assertIn(hint, body["error"]["message"].lower())
+            tm.mark_account_cooldown.assert_not_called()
+
+    async def test_output_cap_and_endpoint_come_from_the_catalogue(self):
+        """Claude Code asks for 32000; the catalogue knows space-bunny-free stops well below that."""
+        session = FakeSession([FakeResponse(200, sse_lines([{"choices": [{"delta": {"content": "x"}}]}]))])
+        client = OpenCodeClient(make_token_manager([{"email": "a@b"}]), http_session=session)
+        client._catalog = {"base_url": "https://zen.test", "headers": {"x-opencode-org-id": "org_1"},
+                           "models": {"space-bunny-free": {"name": "Space Bunny", "free": True, "output": 8192}},
+                           "source": "console"}
+        await fold_sse_to_message(client.generate_stream(
+            {"model": "space-bunny-free", "messages": [], "max_tokens": 32000}))
+        url, body, headers = session.sent[0]
+        self.assertEqual(url, "https://zen.test/chat/completions")
+        self.assertEqual(body["max_completion_tokens"], 8192)
+        self.assertEqual(headers["x-opencode-org-id"], "org_1")
 
     async def test_rate_limit_fails_over_to_the_next_account(self):
         session = FakeSession([

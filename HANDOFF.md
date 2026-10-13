@@ -135,9 +135,26 @@ prefix because that is what the client sends; Zen only ever receives the bare id
 | `opencode/nemotron-3.5-lightning-free` | `nemotron-3.5-lightning-free` | Zen |
 | `opencode/union-alpha` | `union-alpha` | Zen |
 
-Authentication is a Console device-code login (`python cli_auth.py login --provider opencode`),
-stored in the same `accounts.json` pool as the Google accounts but under a separate active pointer,
-so switching providers never disturbs the other.
+Authentication is a Console device-code login (`python cli_auth.py login --provider opencode`) or a
+Console API key (`--api-key`), stored in the same `accounts.json` pool as the Google accounts but
+under a separate active pointer, so switching providers never disturbs the other.
+
+**Which models are reachable** comes from `GET /console/api/v2/config` (endpoint, `x-opencode-org-id`,
+per-model cost/limit/disabled flags) with `GET /inference/v1/models` as the fallback; see
+`auth/opencode_catalog.py`. The hardcoded list in `backend/router.py` is only what a cold process
+advertises. A bare id routes to Zen only for its free-tier shapes (`-free` suffix, `big-pickle`);
+everything else needs the `opencode/` prefix, because Zen also serves `claude-sonnet-4-6` and
+`gemini-3.8-flash`, and those ids belong to Antigravity in this proxy.
+
+**Free tier** (verified live against the gateway on 2026-10-14): Zen answers
+`403 {"type":"FreeTierError"}` for every cost-0 model when the credential is a Console **session**
+token (`st_…`), regardless of endpoint, `User-Agent`, `x-opencode-*` headers, `x-opencode-org-id`,
+HTTP version, or system prompt. A paid model with the same token reaches the upstream provider
+(`402 Insufficient account funds`), so the token and endpoint are right - the gate is on the
+credential kind. The docs (https://opencode.ai/docs/zen) issue an **API key** for programmatic
+access and list the free models at $0 there, so the API key is the credential to use:
+`python cli_auth.py login --provider opencode --api-key <KEY>`, then
+`python cli_auth.py check --provider opencode` to verify with one real request.
 
 **Translation notes** (all mirrored from `anomalyco/opencode`, `packages/ai/src/protocols/openai-chat.ts`):
 - Only `messages[0]` may carry `role: "system"`. Claude Code interleaves system turns *between*
@@ -208,7 +225,8 @@ so switching providers never disturbs the other.
    - **Block lifecycle:** every Anthropic `content_block_start` is emitted exactly once per index, carrying the block's real type. A tool call used to be preceded by a placeholder `text` start on the same index — malformed, and invisible to the tests because folding overwrites the first start with the second.
    - **Token-bookkeeping shapes:** `<total_tokens>` is recognized with and without the `token(s)` word and `left`/`remaining`, otherwise every bookkeeping turn turns back into a `<system-update>` noise message. A tag quoted inside a real instruction is kept, because the body may not contain sentence punctuation and stripping is line-anchored.
    - **Output cap:** Claude Code always asks for `max_tokens: 32000`, while free Zen models cap far below it and answer 400. A 400 that names the cap is retried once without `max_completion_tokens`; an unrelated 400 (unknown tool, bad schema) is surfaced unchanged and never retried.
-   - **Catalogue availability:** `/v1/models` appends the static Zen catalogue on every path, including when Google discovery fails — a Zen-only account has no Google token, and would otherwise be offered no models at all.
+   - **Catalogue availability:** `/v1/models` appends the Zen catalogue on every path, including when Google discovery fails — a Zen-only account has no Google token, and would otherwise be offered no models at all.
+   - **Policy refusals are not credential failures:** `FreeTierError`, `RegionError` and `ModelDeprecated` are parsed out of the gateway's own error body and mapped to `permission_error` / `not_found_error` with the reason spelled out. None of them cool the account down; cooling on a 403 used to mute a perfectly good login behind a phantom rate limit.
 
 ---
 
@@ -220,6 +238,7 @@ python -m unittest discover -s tests
 ```
 - `tests/test_opencode_client.py`: payload translation, provider-prefix stripping, system-turn lowering and token-bookkeeping filtering, tool adjacency, `is_error`, `strict`, `reasoning_effort`, truncated tool JSON, thinking blocks, one-`content_block_start`-per-index, output-cap retry, error mapping, account failover, and session ownership.
 - `tests/test_server.py` (10 tests): verifies health, models resolution, auto-mode classifier stub, accounts REST endpoints, count_tokens, and web dashboard endpoints (/dashboard, /api/stats, /api/events).
+- `tests/test_opencode_catalog.py`: Console-config parsing, `/models` merging, source fallback, per-token caching, and the offline `peek`.
 - `tests/test_multi_account.py` (6 tests): verifies multi-account pool, active switching, removal, model cooldown tracking, round-robin rotation, and automated 429 failover.
 
 ---

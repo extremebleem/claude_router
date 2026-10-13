@@ -1,19 +1,44 @@
 from typing import Any, Optional, Dict, List
 
-# Model ids advertised by /v1/models for the Zen backend. The opencode/ prefix is what the client
-# must send, but Zen itself only ever receives the bare id (see backend.opencode.zen_model_id).
+from auth.opencode_catalog import routable_models
+from auth.opencode_catalog import peek_catalog as peek
+
+# Advertised when the live catalogue has not been fetched yet. It is a snapshot, not a source of
+# truth: /v1/models replaces it with whatever the account can actually reach, and the router
+# recognises the live ids once the catalogue is warm.
 OPENCODE_MODELS = [
     "space-bunny-free",
     "opencode/big-pickle",
+    "opencode/cat-jam-free",
     "opencode/ling-3.0-flash-fin-free",
+    "opencode/ling-3.1-flash-free",
     "opencode/mimo-v2.5-free",
+    "opencode/mimo-v2.6-flash-free",
     "opencode/nemotron-3-ultra-free",
     "opencode/nemotron-3.5-lightning-free",
-    "opencode/union-alpha",
+    "opencode/longcat-2.5-preview-free",
+    "opencode/step-5-preview-free",
 ]
 
-# Bare (prefix-stripped) ids routed to Zen even when the client sends them without the namespace.
-OPENCODE_BARE_PREFIXES = ("space-bunny",)
+# Bare ids that belong to Zen even without the namespace. Zen names its sponsored models either
+# with a -free suffix or as a stealth release; neither shape collides with an Antigravity id.
+FREE_MODEL_SUFFIXES = ("-free",)
+FREE_MODEL_IDS = ("big-pickle",)
+
+
+def is_free_tier_model(model_id: str) -> bool:
+    bare = (model_id or "").rsplit("/", 1)[-1].lower()
+    return bare.endswith(FREE_MODEL_SUFFIXES) or bare in FREE_MODEL_IDS
+
+
+def opencode_model_ids() -> List[str]:
+    """Ids advertised for Zen: the live catalogue when warm, the snapshot otherwise."""
+    live = routable_models(peek())
+    if not live:
+        return list(OPENCODE_MODELS)
+    # space-bunny-free stays unprefixed so the common case stays short to type; the rest carry the
+    # namespace the client must send, matching how opencode itself names them.
+    return [m if m == "space-bunny-free" else f"opencode/{m}" for m in sorted(live)]
 
 
 class ProviderRouter:
@@ -23,14 +48,13 @@ class ProviderRouter:
 
     def resolve_provider(self, model: str) -> str:
         model_lower = (model or "").strip().lower()
-        if model_lower.startswith("opencode/") or model_lower in OPENCODE_MODELS:
+        if model_lower.startswith("opencode/"):
             return "opencode"
-        # Matched on the bare id and anchored to the start, so an unrelated model that merely
-        # mentions space-bunny in its name is not hijacked.
         bare = model_lower.rsplit("/", 1)[-1]
-        if bare.startswith(OPENCODE_BARE_PREFIXES):
-            return "opencode"
-        return "antigravity"
+        # Bare ids go to Zen only for its free-tier models. Zen also serves claude-sonnet-4-6 and
+        # gemini-3.8-flash, and those ids belong to Antigravity in this proxy - claiming them from
+        # the catalogue would silently move a Google conversation onto a paid Zen model.
+        return "opencode" if is_free_tier_model(bare) else "antigravity"
 
     def resolve_client(self, model: str) -> Any:
         provider = self.resolve_provider(model)
@@ -40,7 +64,7 @@ class ProviderRouter:
 
     def list_all_models(self, antigravity_models: Optional[List[str]] = None) -> List[str]:
         models = list(antigravity_models or [])
-        for m in OPENCODE_MODELS:
+        for m in opencode_model_ids():
             if m not in models:
                 models.append(m)
         return models

@@ -31,10 +31,15 @@ Enables running the **Claude Code CLI** in a fully isolated sandbox, while also 
    * Support for direct Gemini API keys (`AIzaSy...`).
 
 5. **Second Provider: OpenCode Zen**:
-   * Model ids starting with `opencode/` (plus `space-bunny-free`) are routed to `https://opencode.ai/inference/v1` instead of Cloud Code.
-   * Sign in with the Console device flow: `python cli_auth.py login --provider opencode`. API keys work too.
+   * Model ids starting with `opencode/` (plus `space-bunny-free` and the other `*-free` ids) are routed to `https://opencode.ai/inference/v1` instead of Cloud Code.
+   * Sign in with the Console device flow (`python cli_auth.py login --provider opencode`) or with a Console API key (`--api-key <KEY>`).
    * Requests are translated to Zen's OpenAI-compatible shape, matching what the opencode app itself sends.
+   * The model list, output caps and endpoint are read from the account's Console config, so a model that appears, disappears or changes price shows up without a code change.
    * Zen accounts live in the same pool as Google accounts but keep their own active pointer, so switching one never disturbs the other.
+   * `python cli_auth.py check --provider opencode` sends one real request and reports what is reachable.
+
+   Note: Zen serves its free (`cost: 0`) models to the official OpenCode client. A Console **session**
+   token gets `403 FreeTierError` on them; use a Console **API key** for those models.
 
 ---
 

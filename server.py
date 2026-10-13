@@ -32,7 +32,9 @@ from auth.token_manager import TokenManager
 from auth.discovery import fetch_available_models
 from backend.antigravity import AntigravityClient, CloudCodeClient
 from backend.opencode import OpenCodeClient, fold_sse_to_message, OPENCODE_ERROR_STATUS
-from backend.router import ProviderRouter, OPENCODE_MODELS
+from backend.router import ProviderRouter, opencode_model_ids
+from auth.opencode_catalog import get_catalog, peek_catalog
+from auth.opencode_oauth import OPENCODE_USER_AGENT
 from backend.gemini_api import GeminiApiClient
 from transformer.signatures import signature_cache
 from transformer.streamer import parse_google_sse_stream, aggregate_sse_stream_to_json
@@ -250,22 +252,35 @@ class SuppressDisconnectFilter(logging.Filter):
 
 
 def merge_opencode_models(models: list, now: float) -> list:
-    """Appends the Zen models the router can dispatch to. The Zen catalogue is static, so it is
-    advertised on every path - including the ones where Google discovery failed, which is exactly
-    the state a Zen-only account is in."""
+    """Appends the Zen models the router can dispatch to. The catalogue is static and served from
+    cache, so it is advertised on every path - including the ones where Google discovery failed,
+    which is exactly the state a Zen-only account is in."""
     iso_time = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
-    for oc_model in OPENCODE_MODELS:
-        if not any(m["id"] == oc_model for m in models):
-            models.append({
-                "id": oc_model,
-                "type": "model",
-                "display_name": f"OpenCode {oc_model}",
-                "created_at": iso_time,
-                "object": "model",
-                "created": int(now),
-                "owned_by": "opencode",
-                "description": f"OpenCode {oc_model} (Zen Gateway)",
-            })
+    catalog = peek_catalog()
+    for model_id in sorted(catalog.get("models", {})):
+        if (catalog["models"][model_id] or {}).get("disabled"):
+            continue
+        advertised = model_id if model_id == "space-bunny-free" else f"opencode/{model_id}"
+        if any(m["id"] == advertised for m in models):
+            continue
+        info = catalog["models"][model_id] or {}
+        limits = []
+        if info.get("context"):
+            limits.append(f"{int(info['context'] // 1000)}K context")
+        if info.get("output"):
+            limits.append(f"{int(info['output'] // 1000)}K max output")
+        price = "free" if info.get("free") else "paid"
+        models.append({
+            "id": advertised,
+            "type": "model",
+            "display_name": f"{info.get('name') or model_id} ({price})",
+            "created_at": iso_time,
+            "object": "model",
+            "created": int(now),
+            "owned_by": "opencode",
+            "description": f"{info.get('name') or model_id} - {price} via OpenCode Zen"
+                           + (f" ({', '.join(limits)})" if limits else ""),
+        })
     return models
 
 
@@ -938,11 +953,20 @@ class ProxyApp:
             finally:
                 upstream_resp.close()
 
+    async def refresh_opencode_catalog(self):
+        """Keeps the Zen catalogue warm: which models exist, which are free, and what each account's
+        endpoint and org header are. Cached process-wide, so this is a no-op between refreshes."""
+        account = self.token_manager.get_active_account(provider="opencode")
+        token = account.get("access_token") if account else None
+        await asyncio.to_thread(get_catalog, token, OPENCODE_USER_AGENT)
+
     async def get_dynamic_models(self) -> list:
         """Fetches the real models supported by the Google account with 120s TTL cache."""
         now = time.time()
         if self._models_cache and (now - self._models_cache_time < 120):
             return self._models_cache
+
+        await self.refresh_opencode_catalog()
 
         try:
             res = self.token_manager.get_valid_token()
@@ -1157,7 +1181,7 @@ class ProxyApp:
             "total": len(data),
             "active_email": active_email,
             "opencode_accounts": self.opencode_accounts_info(),
-            "opencode_models": OPENCODE_MODELS,
+            "opencode_models": opencode_model_ids(),
             "gemini_api_key_configured": bool(self.token_manager.get_gemini_api_key())
         })
 

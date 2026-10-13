@@ -63,16 +63,22 @@ ANTIGRAVITY_HEADERS = {
 }
 
 # OpenCode Zen gateway.
-# The public catalog (models.dev) lists api = https://opencode.ai/inference/v1, but a signed-in
-# Console account is served its own endpoint by GET /console/api/config ("Personal / OpenCode"
-# provider), and that is the one the real CLI uses. Default to the Console form; override with
-# OPENCODE_ZEN_BASE_URL if the catalog endpoint is what your plan expects.
-OPENCODE_ZEN_BASE_URL = os.environ.get("OPENCODE_ZEN_BASE_URL", "https://opencode.ai/inference/openai/v1")
+# Two endpoints exist and both accept the same credentials:
+#   * https://opencode.ai/inference/v1        - the documented public API (docs.opencode.ai/zen),
+#                                              also serves /models; this is what an API key is issued for.
+#   * https://opencode.ai/inference/openai/v1 - the endpoint the opencode app itself gets from
+#                                              GET /console/api/v2/config.
+# The public one is the supported programmatic surface, so it is the default. The Console config
+# still overrides it per account (see auth/opencode_catalog.py), and OPENCODE_ZEN_BASE_URL wins over both.
+OPENCODE_ZEN_BASE_URL = os.environ.get("OPENCODE_ZEN_BASE_URL", "https://opencode.ai/inference/v1")
+OPENCODE_CONSOLE_URL = os.environ.get("OPENCODE_CONSOLE_URL", "https://opencode.ai/console")
 # Sent as x-opencode-project. opencode sends the real session.projectID; there is no equivalent
 # in the Anthropic request, so this is the closest stable stand-in.
 OPENCODE_PROJECT_ID = os.environ.get("OPENCODE_PROJECT_ID", "global")
 # Sent as x-opencode-client (App.name in packages/core/src/app.ts).
 OPENCODE_CLIENT_NAME = os.environ.get("OPENCODE_CLIENT_NAME", "opencode")
+# Free-tier models are the point of the Zen account, so they are what the access check probes.
+OPENCODE_PROBE_MODEL = os.environ.get("OPENCODE_PROBE_MODEL", "space-bunny-free")
 
 
 DEFAULT_FALLBACK_PROJECT_ID = os.environ.get("PROXY_FALLBACK_PROJECT_ID", "rising-fact-p41fc")

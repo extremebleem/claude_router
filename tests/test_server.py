@@ -13,6 +13,20 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from server import ProxyApp
 from auth.token_manager import TokenManager
+from auth.opencode_catalog import static_snapshot
+
+_catalog_patcher = None
+
+
+def setUpModule():
+    """Keeps the suite offline: /v1/models refreshes the Zen catalogue, which is network IO."""
+    global _catalog_patcher
+    _catalog_patcher = patch("server.get_catalog", side_effect=lambda token=None, ua="": static_snapshot())
+    _catalog_patcher.start()
+
+
+def tearDownModule():
+    _catalog_patcher.stop()
 
 
 class TestServerEndpoints(AioHTTPTestCase):
@@ -58,6 +72,22 @@ class TestServerEndpoints(AioHTTPTestCase):
         detail_data = await resp_detail.json()
         self.assertEqual(detail_data["id"], "gemini-3.8")
         self.assertEqual(detail_data["type"], "model")
+
+    @unittest_run_loop
+    async def test_zen_catalogue_drives_the_advertised_models(self):
+        """A model the snapshot has never heard of still has to reach the client, with its limits."""
+        headers = {"Authorization": "Bearer secret_sandbox_token"}
+        catalog = {"base_url": "https://zen.test", "headers": {}, "source": "console", "models": {
+            "brand-new-free": {"name": "Brand New Free", "free": True, "output": 16384, "context": 262144},
+            "hidden-model": {"name": "Hidden", "free": False, "disabled": True},
+        }}
+        with patch("server.peek_catalog", return_value=catalog):
+            resp = await self.client.get("/v1/models", headers=headers)
+        models = {m["id"]: m for m in (await resp.json())["data"]}
+        self.assertIn("opencode/brand-new-free", models)
+        self.assertNotIn("opencode/hidden-model", models)
+        self.assertIn("free", models["opencode/brand-new-free"]["description"])
+        self.assertIn("16K max output", models["opencode/brand-new-free"]["description"])
 
 
     @unittest_run_loop

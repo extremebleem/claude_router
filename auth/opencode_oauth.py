@@ -9,7 +9,7 @@ import webbrowser
 from typing import Dict, Any, Optional
 import aiohttp
 
-from config import OPENCODE_CLIENT_NAME
+from config import OPENCODE_CLIENT_NAME, OPENCODE_PROBE_MODEL, OPENCODE_ZEN_BASE_URL
 
 # Same flow as packages/core/src/plugin/provider/opencode.ts in github.com/anomalyco/opencode
 OPENCODE_CONSOLE_URL = "https://opencode.ai/console"
@@ -107,8 +107,64 @@ def refresh_opencode_token(refresh_token: str) -> Dict[str, Any]:
     return payload
 
 
-async def login_opencode_flow(token_manager) -> bool:
-    """Runs interactive login flow for an OpenCode account and stores it in TokenManager."""
+def api_key_account(api_key: str) -> Dict[str, Any]:
+    """Account entry for a Console API key. The key is the credential the docs issue for
+    programmatic access (https://opencode.ai/docs/zen) and the one free-tier models are served to."""
+    key_id = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:8]
+    return {"id": f"opencode_key_{key_id}@opencode.ai", "email": f"opencode_key_{key_id}@opencode.ai",
+            "provider": "opencode", "access_token": api_key}
+
+
+def store_api_key(token_manager, api_key: str) -> Dict[str, Any]:
+    """Verifies the key against the public model list before storing it, so a typo fails here
+    rather than as a 401 on the next conversation turn."""
+    account = api_key_account(api_key)
+    request = urllib.request.Request(
+        f"{OPENCODE_ZEN_BASE_URL}/models",
+        headers={"Accept": "application/json", "User-Agent": OPENCODE_USER_AGENT,
+                 "Authorization": f"Bearer {api_key}"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        if response.status != 200:
+            raise RuntimeError(f"model list returned HTTP {response.status}")
+    token_manager.add_or_update_account(account)
+    return account
+
+
+def probe_access(access_token: str, model: Optional[str] = None, base_url: Optional[str] = None) -> Dict[str, Any]:
+    """Sends the smallest possible real request and reports what Zen says.
+
+    This is the only way to tell the three failure modes apart - bad key, no funds, free-tier gate -
+    because they all arrive as one HTTP status with a type the client has to interpret.
+    """
+    model = model or OPENCODE_PROBE_MODEL
+    url = f"{(base_url or OPENCODE_ZEN_BASE_URL).rstrip('/')}/chat/completions"
+    body = json.dumps({"model": model, "messages": [{"role": "user", "content": "ping"}],
+                       "max_completion_tokens": 8, "stream": False}).encode("utf-8")
+    request = urllib.request.Request(url, data=body, method="POST", headers={
+        "Content-Type": "application/json", "User-Agent": OPENCODE_USER_AGENT,
+        "Authorization": f"Bearer {access_token}",
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return {"ok": True, "status": response.status, "model": model, "message": ""}
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "status": e.code, "model": model, "message": e.read().decode("utf-8", "replace")[:400]}
+    except Exception as e:
+        return {"ok": False, "status": None, "model": model, "message": repr(e)}
+
+
+async def login_opencode_flow(token_manager, api_key: Optional[str] = None) -> bool:
+    """Stores a Console API key, or runs the interactive device flow when no key is given."""
+    if api_key:
+        try:
+            account = store_api_key(token_manager, api_key.strip())
+        except Exception as e:
+            print(f"OpenCode API key rejected: {e}")
+            return False
+        print(f"Successfully added OpenCode API key account '{account['email']}' to pool!")
+        return True
+
     print("Initiating OpenCode device authorization flow...")
     account = None
     try:
@@ -154,9 +210,7 @@ async def login_opencode_flow(token_manager) -> bool:
             api_key = ""
         if not api_key:
             return False
-        # Stable id: adding the same key again updates the entry instead of duplicating it
-        key_id = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:8]
-        account = {"email": f"opencode_key_{key_id}@opencode.ai", "access_token": api_key}
+        account = api_key_account(api_key)
 
     account.update({"id": account["email"], "provider": "opencode"})
     token_manager.add_or_update_account(account)

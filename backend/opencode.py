@@ -8,6 +8,7 @@ from typing import Dict, Any, List, Optional, AsyncGenerator, Tuple
 import aiohttp
 
 from auth.opencode_oauth import OPENCODE_USER_AGENT
+from auth.opencode_catalog import get_catalog, output_limit
 from config import OPENCODE_CLIENT_NAME, OPENCODE_PROJECT_ID, OPENCODE_ZEN_BASE_URL
 from logger import log
 from transformer.opencode_prompts import (
@@ -416,12 +417,56 @@ async def fold_sse_to_message(chunks: AsyncGenerator[str, None]) -> Tuple[int, D
     return 200, message
 
 
+def upstream_error_kind(detail: str) -> Optional[str]:
+    """Extracts the gateway's own error type, e.g. FreeTierError, from an error body.
+
+    Zen answers with {"type": "error", "error": {"type": "<Kind>", "message": "..."}} (and a flat
+    {"error": {"type": ...}} from some upstream paths), so the type is what tells a policy refusal
+    apart from a broken credential.
+    """
+    if not detail or "{" not in detail:
+        return None
+    try:
+        body = json.loads(detail[detail.index("{"):])
+    except ValueError:
+        return None
+    while isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict) and isinstance(error.get("type"), str):
+            return error["type"]
+        if isinstance(body.get("type"), str) and body["type"] not in ("error",):
+            return body["type"]
+        body = error if isinstance(error, dict) else None
+    return None
+
+
+# Policy refusals: the credential works, the account is simply not allowed to run this model.
+# Cooling the account down for these would mute a perfectly good login.
+POLICY_ERRORS: Dict[str, Tuple[str, str]] = {
+    "FreeTierError": (
+        "permission_error",
+        "OpenCode serves its free-tier models only to its own client; a Console session token is not "
+        "enough. Create an API key at https://opencode.ai/console and run "
+        "'python cli_auth.py login --provider opencode --api-key <KEY>'",
+    ),
+    "RegionError": ("permission_error", "This OpenCode model is not available in your region."),
+    "ModelDeprecated": ("not_found_error", "This OpenCode model has been deprecated and was removed from Zen."),
+}
+
+
 class OpenCodeClient:
     def __init__(self, token_manager, base_url: str = OPENCODE_ZEN_BASE_URL, http_session=None):
         self.token_manager = token_manager
         self.base_url = base_url.rstrip("/")
         # Reused across requests; a fresh session per turn would pay a full TLS handshake every time.
         self.http_session = http_session
+        self._catalog: Optional[Dict[str, Any]] = None
+
+    async def catalog(self, token: Optional[str] = None) -> Dict[str, Any]:
+        """Live catalogue for this pool, fetched off the event loop and cached process-wide."""
+        if self._catalog is None:
+            self._catalog = await asyncio.to_thread(get_catalog, token, OPENCODE_USER_AGENT)
+        return self._catalog
 
     def _candidate_accounts(self, model_name: str) -> List[Dict[str, Any]]:
         """Accounts to try for this model, active one first. Empty when the pool is empty or
@@ -432,10 +477,13 @@ class OpenCodeClient:
             model_name, provider="opencode", allow_cooldown_fallback=False
         )
 
-    def _request_headers(self, token: str, anthropic_req: Dict[str, Any]) -> Dict[str, str]:
-        # Same headers opencode adds to every model request (session/model-request.ts)
+    def _request_headers(self, token: str, anthropic_req: Dict[str, Any],
+                         catalog: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+        # Same headers opencode adds to every model request (session/model-request.ts), plus
+        # whatever the Console handed this account (x-opencode-org-id), which it uses to attribute
+        # the request to the workspace.
         affinity = conversation_affinity(anthropic_req)
-        return {
+        headers = {
             "Authorization": f"Bearer {token}",
             "x-opencode-session-id": conversation_session_id(anthropic_req),
             "x-session-affinity": affinity,
@@ -446,6 +494,8 @@ class OpenCodeClient:
             "x-opencode-client": OPENCODE_CLIENT_NAME,
             "Content-Type": "application/json",
         }
+        headers.update((catalog or {}).get("headers") or {})
+        return headers
 
     def _account_error(self, status: int, detail: str, account: Dict[str, Any],
                        model_name: str) -> Tuple[str, str]:
@@ -453,6 +503,11 @@ class OpenCodeClient:
         helps. Cooldowns are per model, so one throttled model does not mute the rest of the pool."""
         kind = HTTP_STATUS_ERRORS.get(status, "api_error")
         ident = _account_id(account)
+        policy = POLICY_ERRORS.get(upstream_error_kind(detail) or "")
+        if policy:
+            # The account is fine; the request is not allowed. Cooling it down would hide the
+            # reason behind a rate limit and mute the whole pool for a policy decision.
+            return policy[0], f"OpenCode refused {model_name} for {ident}: {policy[1]}"
         if status == 429:
             self.token_manager.mark_account_cooldown(
                 ident, cooldown_seconds=DEFAULT_COOLDOWN_SECONDS, model=model_name, provider="opencode"
@@ -484,7 +539,12 @@ class OpenCodeClient:
                 yield _error("authentication_error", NO_ACCOUNT_MESSAGE)
             return
 
-        url = f"{self.base_url}/chat/completions"
+        # The account's own endpoint and org header come from the Console config; the documented
+        # public endpoint is the fallback when there is no Console login to ask.
+        catalog = await self.catalog(accounts[0].get("access_token") if accounts else None)
+        base_url = (catalog.get("base_url") or self.base_url).rstrip("/")
+        url = f"{base_url}/chat/completions"
+        cap = output_limit(catalog, model_name)
         msg_id = f"msg_{int(time.time() * 1000)}"
         owned_session = self.http_session
         if owned_session is None:
@@ -503,9 +563,13 @@ class OpenCodeClient:
                 payload = anthropic_to_opencode_payload(anthropic_req)
                 payload["stream"] = True
                 payload["stream_options"] = {"include_usage": True}
+                # Claude Code always asks for its own max_tokens; the catalogue knows the real cap.
+                if cap and payload.get("max_completion_tokens", 0) > cap:
+                    payload["max_completion_tokens"] = cap
 
                 try:
-                    response = await self._post(owned_session, url, payload, self._request_headers(token, anthropic_req))
+                    response = await self._post(
+                        owned_session, url, payload, self._request_headers(token, anthropic_req, catalog))
                 except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                     last_error = ("api_error", f"OpenCode connection error: {e}")
                     continue
