@@ -7,7 +7,7 @@ and direct Gemini API keys.
 import sys
 import json
 import time
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Union
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -21,8 +21,8 @@ from logger import log
 
 
 class TokenManager:
-    def __init__(self, storage_path: Path = ACCOUNTS_FILE):
-        self.storage_path = storage_path
+    def __init__(self, storage_path: Union[Path, str] = ACCOUNTS_FILE):
+        self.storage_path = Path(storage_path) if isinstance(storage_path, str) else storage_path
         self._data = self._load()
         # Cooldown tracking: {(email, model): timestamp_until}
         self._exhausted_accounts: Dict[Tuple[str, str], float] = {}
@@ -55,21 +55,27 @@ class TokenManager:
 
     def add_or_update_account(self, account: Dict[str, Any]):
         """Adds or updates an account entry in the accounts store."""
-        email = account.get("email")
+        email = account.get("email") or account.get("id")
         if not email:
-            email = f"unknown_{int(time.time())}@antigravity"
+            email = f"unknown_{int(time.time())}@account"
             account["email"] = email
+        if "id" not in account:
+            account["id"] = email
 
-        # Discover project ID and subscription tier if not present
-        if "project_id" not in account or not account["project_id"]:
-            meta = discover_project_and_tier(account["access_token"])
-            account["project_id"] = meta.get("project_id")
-            account["tier"] = meta.get("tier")
-            account["tier_id"] = meta.get("tier_id")
+        provider = account.get("provider", "google")
+        account["provider"] = provider
+
+        # Discover project ID and subscription tier if google and not present
+        if provider == "google" and ("project_id" not in account or not account["project_id"]):
+            if "access_token" in account and account["access_token"]:
+                meta = discover_project_and_tier(account["access_token"])
+                account["project_id"] = meta.get("project_id")
+                account["tier"] = meta.get("tier")
+                account["tier_id"] = meta.get("tier_id")
 
         existing_index = None
         for i, acc in enumerate(self._data["accounts"]):
-            if acc.get("email") == email:
+            if (acc.get("email") == email) or (acc.get("id") == email):
                 existing_index = i
                 break
 
@@ -78,10 +84,14 @@ class TokenManager:
         else:
             self._data["accounts"].append(account)
 
-        if not self._data.get("active_email"):
+        if not self._data.get("active_email") and provider == "google":
             self._data["active_email"] = email
 
         self._save()
+
+    def add_account(self, account: Dict[str, Any]):
+        """Alias for add_or_update_account."""
+        return self.add_or_update_account(account)
 
     def get_accounts(self) -> List[Dict[str, Any]]:
         return self._data.get("accounts", [])
@@ -226,14 +236,33 @@ class TokenManager:
                 return
         raise ValueError(f"Account with email '{email}' not found.")
 
-    def get_active_account(self) -> Optional[Dict[str, Any]]:
+    def get_accounts(self, provider: Optional[str] = None) -> List[Dict[str, Any]]:
+        accounts = self._data.get("accounts", [])
+        if provider:
+            return [acc for acc in accounts if acc.get("provider", "google") == provider]
+        return accounts
+
+    def get_active_account(self, provider: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        accounts = self.get_accounts(provider=provider)
+        if not accounts:
+            return None
+
         active_email = self._data.get("active_email")
-        for acc in self._data.get("accounts", []):
-            if acc.get("email") == active_email:
+        if active_email:
+            for acc in accounts:
+                email = acc.get("email") or acc.get("id")
+                if email == active_email and not self.is_account_exhausted(email):
+                    return acc
+
+        for acc in accounts:
+            email = acc.get("email") or acc.get("id")
+            if not self.is_account_exhausted(email):
                 return acc
-        if self._data.get("accounts"):
-            return self._data["accounts"][0]
         return None
+
+    def mark_account_cooldown(self, email_or_id: str, cooldown_seconds: float = 300.0, model: str = "*", provider: Optional[str] = None):
+        """Places account into cooldown."""
+        self.mark_account_exhausted(email_or_id, model=model, cooldown_seconds=cooldown_seconds)
 
     def get_token_for_account(self, account: Dict[str, Any], force_refresh: bool = False) -> Tuple[Optional[str], Optional[str]]:
         """
