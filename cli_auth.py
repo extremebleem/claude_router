@@ -3,6 +3,7 @@
 CLI utility for managing authentication and multi-account pool in Claude-Gemini Proxy.
 Usage:
     python cli_auth.py login           - Interactive Google OAuth login via browser
+    python cli_auth.py login --provider opencode - OpenCode Console device login
     python cli_auth.py add             - Alias for login (add another Google account)
     python cli_auth.py status          - Show active account status and token validity
     python cli_auth.py list            - List all stored accounts
@@ -30,6 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from auth.token_manager import TokenManager
 from auth.discovery import fetch_available_models
+from backend.router import OPENCODE_MODELS
 
 
 def cmd_login(manager: TokenManager):
@@ -45,6 +47,42 @@ def cmd_login(manager: TokenManager):
         sys.exit(1)
 
 
+def opencode_account_rows(manager: TokenManager):
+    """Yields (email, is_active, kind, expiry text, cooldown text) for each stored OpenCode account."""
+    active = manager.get_active_account(provider="opencode")
+    active_id = (active.get("email") or active.get("id")) if active else None
+    exhausted = manager.get_exhausted_status()
+    for acc in manager.get_accounts(provider="opencode"):
+        ident = acc.get("email") or acc.get("id")
+        if acc.get("refresh_token"):
+            kind = "Console login"
+            expires_at = acc.get("expires_at")
+            if not expires_at:
+                expiry = "-"
+            elif expires_at < time.time():
+                expiry = "access token expired (refreshes on next request)"
+            else:
+                expiry = "access token until " + datetime.fromtimestamp(expires_at).strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            kind, expiry = "API key", "no expiry"
+        cooldown = ""
+        if ident in exhausted:
+            cooldown = ", ".join(f"{m}: {int(sec)}s" for m, sec in exhausted[ident].items())
+        yield ident, ident == active_id, kind, expiry, cooldown
+
+
+def print_opencode_section(manager: TokenManager):
+    print("\n=== OpenCode Zen ===")
+    rows = list(opencode_account_rows(manager))
+    if not rows:
+        print("✗ No OpenCode accounts. To log in: python cli_auth.py login --provider opencode")
+        return
+    print(f"Models: {', '.join(OPENCODE_MODELS)}")
+    for i, (ident, is_active, kind, expiry, cooldown) in enumerate(rows, 1):
+        print(f"{i}. {ident}{' [ACTIVE]' if is_active else ''}")
+        print(f"   Auth: {kind} | {expiry}" + (f" | ⚠️ Cooldown ({cooldown})" if cooldown else ""))
+
+
 def cmd_status(manager: TokenManager):
     print("=== Authorization Status ===")
     token, project_id = manager.get_valid_token()
@@ -56,6 +94,7 @@ def cmd_status(manager: TokenManager):
         if gemini_key:
             print(f"✓ Direct Gemini API Key configured ({gemini_key[:8]}...)")
         print("  To log in via Google account, run: python cli_auth.py login")
+        print_opencode_section(manager)
         return
 
     email = account.get("email") if account else "Local session"
@@ -72,22 +111,25 @@ def cmd_status(manager: TokenManager):
     else:
         print("Token Expiry: managed by external session")
 
-    total_accs = len(manager.get_accounts())
+    total_accs = len(manager.get_accounts(provider="google"))
     print(f"Total Accounts in Pool: {total_accs}")
 
     gemini_key = manager.get_gemini_api_key()
     if gemini_key:
         print(f"Direct Gemini API Key: configured ({gemini_key[:8]}...) [Auto-fallback active]")
 
+    print_opencode_section(manager)
+
 
 def cmd_list(manager: TokenManager):
-    accounts = manager.get_accounts()
+    accounts = manager.get_accounts(provider="google")
     active = manager.get_active_account()
     active_email = active.get("email") if active else None
 
-    print(f"=== Stored Accounts ({len(accounts)}) ===")
+    print(f"=== Stored Google Accounts ({len(accounts)}) ===")
     if not accounts:
-        print("No stored accounts found. Run 'python cli_auth.py login'")
+        print("No stored Google accounts found. Run 'python cli_auth.py login'")
+        print_opencode_section(manager)
         return
 
     exhausted = manager.get_exhausted_status()
@@ -103,12 +145,15 @@ def cmd_list(manager: TokenManager):
         print(f"{i}. {email}{is_active}")
         print(f"   Project: {acc.get('project_id')} | Tier: {acc.get('tier', 'free')}{cooldown_info}")
 
+    print_opencode_section(manager)
+
 
 def cmd_pool(manager: TokenManager):
     """Displays comprehensive pool status including quotas and cooldowns."""
-    accounts = manager.get_accounts()
+    accounts = manager.get_accounts(provider="google")
     if not accounts:
-        print("No accounts stored in pool. Run 'python cli_auth.py login'")
+        print("No Google accounts stored in pool. Run 'python cli_auth.py login'")
+        print_opencode_section(manager)
         return
 
     active = manager.get_active_account()
@@ -139,6 +184,7 @@ def cmd_pool(manager: TokenManager):
         print(f"✓ Backup Gemini API Key: configured ({gemini_key[:8]}...) - auto-fallback active.")
     else:
         print("ℹ Backup Gemini API Key is not set. To configure: python cli_auth.py set-key <KEY>")
+    print_opencode_section(manager)
     print()
 
 

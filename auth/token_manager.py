@@ -15,6 +15,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from config import ACCOUNTS_FILE
 from auth.oauth import refresh_access_token, login_flow_browser
+from auth.opencode_oauth import refresh_opencode_token
 from auth.discovery import discover_project_and_tier
 from auth.local_detector import detect_local_credentials
 from logger import log
@@ -93,12 +94,12 @@ class TokenManager:
         """Alias for add_or_update_account."""
         return self.add_or_update_account(account)
 
-    def get_accounts(self) -> List[Dict[str, Any]]:
-        return self._data.get("accounts", [])
-
     def remove_account(self, email: str) -> bool:
         """Removes an account from stored accounts and updates active_email if necessary."""
         initial_len = len(self._data.get("accounts", []))
+        removed_provider = next(
+            (acc.get("provider", "google") for acc in self._data.get("accounts", []) if acc.get("email") == email), "google"
+        )
         self._data["accounts"] = [
             acc for acc in self._data.get("accounts", [])
             if acc.get("email") != email
@@ -112,11 +113,10 @@ class TokenManager:
         }
 
         if removed:
-            if self._data.get("active_email") == email:
-                if self._data["accounts"]:
-                    self._data["active_email"] = self._data["accounts"][0].get("email")
-                else:
-                    self._data["active_email"] = None
+            key = self._active_key(removed_provider)
+            if self._data.get(key) == email:
+                same_provider = self.get_accounts(provider=removed_provider)
+                self._data[key] = same_provider[0].get("email") if same_provider else None
             self._save()
         return removed
 
@@ -155,22 +155,26 @@ class TokenManager:
                 self._exhausted_accounts.pop((email, model), None)
         return status
 
-    def get_available_accounts(self, model: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_available_accounts(self, model: Optional[str] = None, provider: Optional[str] = "google",
+                              allow_cooldown_fallback: bool = True) -> List[Dict[str, Any]]:
         """
-        Returns list of stored accounts that are not in cooldown for the requested model.
+        Returns list of stored accounts of `provider` that are not in cooldown for the requested model.
         The currently active account (if available) is prioritized first.
+
+        allow_cooldown_fallback=False keeps the result strictly empty when every account is
+        cooling down, so callers can answer with a rate limit instead of hammering upstream.
         """
-        all_accounts = self.get_accounts()
-        if not all_accounts:
+        all_accounts = self.get_accounts(provider=provider)
+        if not all_accounts and provider == "google":
             # Fallback to local Antigravity if nothing is stored
             local_creds = detect_local_credentials()
             if local_creds:
                 self.add_or_update_account(local_creds)
-                all_accounts = self.get_accounts()
+                all_accounts = self.get_accounts(provider="google")
 
         now = time.time()
         available = []
-        active_email = self._data.get("active_email")
+        active_email = self._data.get(self._active_key(provider))
         active_acc = None
 
         for acc in all_accounts:
@@ -189,6 +193,9 @@ class TokenManager:
             return [active_acc] + available
         if available:
             return available
+
+        if not allow_cooldown_fallback:
+            return []
 
         # Resilience: if every account is cooling down, prefer the account whose
         # cooldown expires soonest instead of wiping the whole cooldown table.
@@ -217,24 +224,42 @@ class TokenManager:
 
         return []
 
-    def get_next_account_round_robin(self, model: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def cooldown_remaining(self, provider: Optional[str] = "google", model: Optional[str] = None) -> float:
+        """Seconds until the soonest cooldown for this provider expires; 0 when nothing is cooling."""
+        known_emails = {a.get("email") for a in self.get_accounts(provider=provider) if a.get("email")}
+        if not known_emails:
+            return 0.0
+        now = time.time()
+        waits = [
+            until - now for (email, _m), until in self._exhausted_accounts.items()
+            if email in known_emails and until > now
+        ]
+        return max(0.0, min(waits)) if waits else 0.0
+
+    def get_next_account_round_robin(self, model: Optional[str] = None,
+                                     provider: Optional[str] = "google") -> Optional[Dict[str, Any]]:
         """Selects the next available account using round-robin rotation."""
-        available = self.get_available_accounts(model)
+        available = self.get_available_accounts(model, provider=provider)
         if not available:
             return None
         self._rotation_index = (self._rotation_index + 1) % len(available)
         selected = available[self._rotation_index]
-        self._data["active_email"] = selected.get("email")
+        self._data[self._active_key(provider)] = selected.get("email")
         self._save()
         return selected
 
     def set_active_account(self, email: str):
         for acc in self._data.get("accounts", []):
             if acc.get("email") == email:
-                self._data["active_email"] = email
+                self._data[self._active_key(acc.get("provider", "google"))] = email
                 self._save()
                 return
         raise ValueError(f"Account with email '{email}' not found.")
+
+    @staticmethod
+    def _active_key(provider: Optional[str]) -> str:
+        """Each provider keeps its own active account, so switching OpenCode never changes the Google one."""
+        return "active_email" if provider in (None, "google") else f"active_email_{provider}"
 
     def get_accounts(self, provider: Optional[str] = None) -> List[Dict[str, Any]]:
         accounts = self._data.get("accounts", [])
@@ -242,12 +267,12 @@ class TokenManager:
             return [acc for acc in accounts if acc.get("provider", "google") == provider]
         return accounts
 
-    def get_active_account(self, provider: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def get_active_account(self, provider: Optional[str] = "google") -> Optional[Dict[str, Any]]:
         accounts = self.get_accounts(provider=provider)
         if not accounts:
             return None
 
-        active_email = self._data.get("active_email")
+        active_email = self._data.get(self._active_key(provider))
         if active_email:
             for acc in accounts:
                 email = acc.get("email") or acc.get("id")
@@ -276,7 +301,8 @@ class TokenManager:
         if force_refresh or (expires_at and time.time() > (expires_at - 60)):
             if refresh_token:
                 try:
-                    refreshed = refresh_access_token(refresh_token)
+                    refresh = refresh_opencode_token if account.get("provider") == "opencode" else refresh_access_token
+                    refreshed = refresh(refresh_token)
                     account["access_token"] = refreshed["access_token"]
                     account["expires_at"] = refreshed["expires_at"]
                     if "refresh_token" in refreshed:
