@@ -231,6 +231,18 @@ def run_session(exe_path: str, model_override: Optional[str], sandbox_dir: Optio
             "label": "Gemini 3.8 Flash (Search Grounding)",
             "description": "Google Gemini 3.8 Flash with Google Search Grounding",
             "behavesAs": "sonnet"
+        },
+        {
+            "model": "space-bunny-free",
+            "label": "Space Bunny Free (OpenCode Zen)",
+            "description": "MiniMax M3 / Space Bunny Alpha via OpenCode Zen Free Gateway",
+            "behavesAs": "opus"
+        },
+        {
+            "model": "opencode/nemotron-3-ultra-free",
+            "label": "Nemotron 3 Ultra Free (OpenCode Zen)",
+            "description": "NVIDIA Nemotron 3 Ultra via OpenCode Zen Free Gateway",
+            "behavesAs": "sonnet"
         }
     ]
 

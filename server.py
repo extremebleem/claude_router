@@ -821,9 +821,27 @@ class ProxyApp:
         if self._models_cache and (now - self._models_cache_time < 120):
             return self._models_cache
 
-        token, project_id = self.token_manager.get_valid_token()
+        try:
+            res = self.token_manager.get_valid_token()
+            token, project_id = res if res else (None, None)
+        except Exception:
+            token, project_id = None, None
+
         if not token:
-            return AVAILABLE_MODELS
+            results = list(AVAILABLE_MODELS)
+            for oc_model in OPENCODE_MODELS:
+                if not any(m["id"] == oc_model for m in results):
+                    results.append({
+                        "id": oc_model,
+                        "type": "model",
+                        "display_name": f"OpenCode {oc_model}",
+                        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+                        "object": "model",
+                        "created": int(now),
+                        "owned_by": "opencode",
+                        "description": f"OpenCode {oc_model} (Zen Gateway)",
+                    })
+            return results
 
         try:
             loop = asyncio.get_running_loop()
