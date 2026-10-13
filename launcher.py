@@ -256,7 +256,6 @@ def run_session(exe_path: str, model_override: Optional[str], sandbox_dir: Optio
             **(inherited_settings.get("env", {})),
             "ANTHROPIC_BASE_URL": base_url,
             "ANTHROPIC_AUTH_TOKEN": session_token,
-            "ANTHROPIC_MODEL": active_model,
             "ANTHROPIC_DEFAULT_MODEL": active_model,
             "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT": "1",
             "CLAUDE_CODE_MAX_CONTEXT_TOKENS": os.environ.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "500000"),
@@ -308,7 +307,7 @@ def run_session(exe_path: str, model_override: Optional[str], sandbox_dir: Optio
     proc_env["ANTHROPIC_BASE_URL"] = base_url
     proc_env["ANTHROPIC_AUTH_TOKEN"] = session_token
     proc_env.pop("ANTHROPIC_API_KEY", None)  # Stripped so Claude uses pure Bearer gateway auth
-    proc_env["ANTHROPIC_MODEL"] = active_model
+    proc_env.pop("ANTHROPIC_MODEL", None)  # Do not pin ANTHROPIC_MODEL so /model switch works seamlessly
     proc_env["ANTHROPIC_DEFAULT_MODEL"] = active_model
     proc_env["CLAUDE_CODE_AUTO_MODE_SERVER"] = "0"
 
