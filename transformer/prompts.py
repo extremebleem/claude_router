@@ -34,6 +34,9 @@ ANTIGRAVITY_BASE_PROMPT = (
 CORE_CODING_GUIDELINES = (
     "Operating Guidelines:\n"
     "- Always use absolute paths (e.g. Windows style 'C:\\...' or POSIX) when interacting with filesystem tools.\n"
+    "- For Edit tool calls: verify exact lines from Read first; match indentation (spaces vs tabs) with 100% precision; select a unique 3-10 line anchor for old_string to prevent 'String to replace not found'.\n"
+    "- Do not re-read unchanged files: if a file was already read in the conversation and has not been edited, reuse its content.\n"
+    "- For Bash tool calls: do not pass huge inline code snippets via 'python -c \"...\"' on Windows (causes ENAMETOOLONG); use native Write or Edit tool instead.\n"
     "- Preserve existing code structure, comments, and style unless explicitly asked to refactor.\n"
     "- Be concise, direct, and actionable. Do not output conversational filler or restate the user's request.\n"
     "- When calling tools, ensure all parameters strictly match the declared schema.\n"

@@ -304,6 +304,18 @@ class TestTransformer(unittest.TestCase):
         self.assertEqual(gen_gemini["thinkingConfig"]["thinkingBudget"], 2048)
         self.assertNotIn("toolConfig", res_gemini["request"])
 
+    def test_core_coding_guidelines_contain_error_safeguards(self):
+        from transformer.prompts import CORE_CODING_GUIDELINES
+        # Safeguard 1: Edit precision and indentation matching
+        self.assertIn("For Edit tool calls", CORE_CODING_GUIDELINES)
+        self.assertIn("match indentation", CORE_CODING_GUIDELINES)
+
+        # Safeguard 2: Unchanged file re-read avoidance
+        self.assertIn("Do not re-read unchanged files", CORE_CODING_GUIDELINES)
+
+        # Safeguard 3: Windows command line safety against ENAMETOOLONG
+        self.assertIn("ENAMETOOLONG", CORE_CODING_GUIDELINES)
+
 
 class TestStreamer(unittest.IsolatedAsyncioTestCase):
 
