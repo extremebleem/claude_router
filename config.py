@@ -90,3 +90,18 @@ DEFAULT_FALLBACK_PROJECT_ID = os.environ.get("PROXY_FALLBACK_PROJECT_ID", "risin
 # Debug and Logging
 SAVE_DETAILED_REQUEST_LOGS = os.environ.get("PROXY_DEBUG_LOGS", "0").lower() in ("1", "true")
 
+# Tool output sent to a model. Claude Code re-sends every result on every later turn, so an
+# unbounded result is paid for the rest of the session: one 10 KB read cost 2.4 MB of upstream
+# traffic across 255 turns. The head carries the answer; the tail marker says it was cut.
+TOOL_RESULT_MAX_CHARS = int(os.environ.get("PROXY_TOOL_RESULT_MAX_CHARS", "8000"))
+TOOL_RESULT_TAIL_CHARS = 600
+
+# Tool results replayed from history. Claude Code re-sends every past tool message on every turn,
+# and Zen does not cache, so an old 9 KB read cost 2.4 MB of upstream traffic across 255 turns.
+# Only the most recent TOOL_HISTORY_KEEP tool results survive; the rest become one marker message.
+TOOL_HISTORY_KEEP = int(os.environ.get("PROXY_TOOL_HISTORY_KEEP", "8"))
+
+# Whole-conversation budget for a Zen turn. Zen does not cache, so the input grows with every
+# message for the rest of the session; this is where the oldest non-system turns start going.
+CONTEXT_MAX_CHARS = int(os.environ.get("PROXY_CONTEXT_MAX_CHARS", "120000"))
+

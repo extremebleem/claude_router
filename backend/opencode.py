@@ -12,15 +12,20 @@ from auth.opencode_catalog import get_catalog, output_limit
 from backend.proxy_pool import ProxyPool, mask_proxy
 from backend.router import is_free_tier_model
 from config import (
+    CONTEXT_MAX_CHARS,
     OPENCODE_CLIENT_NAME,
     OPENCODE_MERGE_SYSTEM_BLOCKS,
     OPENCODE_PROJECT_ID,
     OPENCODE_ZEN_BASE_URL,
     SAVE_DETAILED_REQUEST_LOGS,
+    TOOL_HISTORY_KEEP,
+    TOOL_RESULT_MAX_CHARS,
+    TOOL_RESULT_TAIL_CHARS,
 )
 from logger import LOGS_DIR, log
 from transformer.opencode_ids import message_identifier, session_identifier
 from transformer.opencode_tool_alias import (
+    FREE_TIER_REQUIRED as RESERVED_TOOL_NAMES,
     client_tool_name,
     free_tier_markers,
     missing_free_tier_tools,
@@ -141,7 +146,12 @@ def _message_text(content: Any) -> str:
 
 def _tool_result_text(part: Dict[str, Any]) -> str:
     """OpenAI tool messages have no is_error flag, so a failure has to be marked in the text;
-    dropping the flag makes a failed call look exactly like a successful one."""
+    dropping the flag makes a failed call look exactly like a successful one.
+
+    Long output is bounded: the client replays every result on every later turn, so an unbounded
+    one is paid for the rest of the session. The head is kept because it holds the answer, and the
+    tail is kept because a truncation is often reported at the end.
+    """
     content = part.get("content", "")
     if isinstance(content, str):
         text = content
@@ -151,9 +161,118 @@ def _tool_result_text(part: Dict[str, Any]) -> str:
         )
     else:
         text = json.dumps(content or "")
+    if len(text) > TOOL_RESULT_MAX_CHARS:
+        dropped = len(text) - TOOL_RESULT_MAX_CHARS
+        text = (text[:TOOL_RESULT_MAX_CHARS]
+                + f"\n... [{dropped} characters cut. The full output is in the tool result "
+                  f"above the tail.]\n" + text[-TOOL_RESULT_TAIL_CHARS:])
     if part.get("is_error"):
         return f"Error: {text}" if text else "Error"
     return text
+
+
+def _drop_unpaired_tool_calls(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keeps an assistant tool_calls turn only when every call it made has a result in this request.
+
+    Zen rejects a tool message whose tool_call_id has no tool_calls entry ahead of it, and a result
+    whose issuing turn is missing (a resumed session sends those). Both are dropped as a unit, so a
+    turn and its results always travel together or not at all.
+    """
+    out: List[Dict[str, Any]] = []
+    i, n = 0, len(messages)
+    while i < n:
+        m = messages[i]
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            calls = {c["id"] for c in m["tool_calls"]}
+            j, results = i + 1, []
+            while j < n and messages[j].get("role") == "tool":
+                results.append(messages[j])
+                j += 1
+            if calls <= {r.get("tool_call_id") for r in results}:
+                out.append(m)
+                out.extend(results)
+            i = j
+            continue
+        if m.get("role") != "tool":
+            out.append(m)
+        i += 1
+    return out
+
+
+def _message_size(m: Dict[str, Any]) -> int:
+    return len(str(m.get("content") or "")) + len(str(m.get("tool_calls") or ""))
+
+
+def trim_tool_history(messages: List[Dict[str, Any]], keep_last: int, max_chars: int) -> List[Dict[str, Any]]:
+    """Drops replayed tool results that are far enough back, keeping the pairing intact.
+
+    Claude Code re-sends every past tool message on every turn and Zen bills each one, so a session
+    pays for its whole output history again and again. max_chars additionally bounds everything left.
+    """
+    messages = _drop_unpaired_tool_calls(messages)
+
+    # A tool_calls turn and the results answering it are one unit; a unit is dropped whole.
+    units: List[List[Dict[str, Any]]] = []
+    cur: Optional[List[Dict[str, Any]]] = None
+    for m in messages:
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            if cur:
+                units.append(cur)
+            cur = [m]
+        elif m.get("role") == "tool" and cur is not None:
+            cur.append(m)
+        else:
+            if cur:
+                units.append(cur)
+                cur = None
+            units.append([m])
+    if cur:
+        units.append(cur)
+
+    dropped_tool = 0
+    tool_units = [u for u in units if any(m.get("role") == "tool" for m in u)]
+    drop = max(0, len(tool_units) - keep_last) if keep_last >= 0 else 0
+    kept_units: List[List[Dict[str, Any]]] = []
+    for u in units:
+        if drop > 0 and u[0].get("role") == "assistant" and u[0].get("tool_calls"):
+            dropped_tool += sum(1 for m in u if m.get("role") == "tool")
+            drop -= 1
+            continue
+        kept_units.append(u)
+    messages = [m for u in kept_units for m in u]
+
+    dropped_turns = 0
+    if max_chars > 0 and sum(_message_size(m) for m in messages) > max_chars:
+        head: List[Dict[str, Any]] = []
+        running = 0
+        cut = 0
+        for i in range(len(messages) - 1, -1, -1):
+            if running + _message_size(messages[i]) > max_chars and head:
+                cut = i + 1
+                break
+            head.insert(0, messages[i])
+            running += _message_size(messages[i])
+        else:
+            cut = 0
+        # Never start the kept history on a tool result whose issuing turn was cut.
+        while cut < len(messages) and messages[cut].get("role") == "tool":
+            cut -= 1
+        dropped_turns = cut
+        messages = messages[cut:]
+
+    out = list(messages)
+    if dropped_tool or dropped_turns:
+        notes: List[str] = []
+        if dropped_tool:
+            notes.append(f"{dropped_tool} earlier tool results were omitted; their output is still "
+                         f"in the session transcript if it is needed again")
+        if dropped_turns:
+            notes.append(f"{dropped_turns} earlier turns of this conversation were omitted for the "
+                         f"same reason")
+        # Marked rather than left silent, so the model reads the gap as history and not as absence.
+        out.insert(0, {"role": "user",
+                       "content": "<context-summary>\n" + "\n".join(notes) + "\n</context-summary>"})
+    return out
 
 
 def _image_part(block: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -340,15 +459,18 @@ def anthropic_to_opencode_payload(anthropic_req: Dict[str, Any], free_tier_marke
         elif choice.get("type") in TOOL_CHOICES:
             payload["tool_choice"] = TOOL_CHOICES[choice["type"]]
 
-    if free_tier_markers_on_wire and payload.get("tools"):
+    if free_tier_markers_on_wire:
         # The names are added, not substituted: the client's own tools go out exactly as written, so
-        # the model keeps the surface Claude Code gave it and the history stays consistent.
-        payload["tools"] = payload["tools"] + free_tier_markers(payload["tools"])
+        # the model keeps the surface Claude Code gave it and the history stays consistent. A turn
+        # with no tools of its own (the client's auxiliary calls) still gets the names, or the free
+        # tier refuses it and the session silently loses its title.
+        payload["tools"] = (payload.get("tools") or []) + free_tier_markers(payload.get("tools") or [])
 
     effort = _reasoning_effort(anthropic_req)
     if effort:
         payload["reasoning_effort"] = effort
 
+    payload["messages"] = trim_tool_history(messages, TOOL_HISTORY_KEEP, CONTEXT_MAX_CHARS)
     return payload
 
 
@@ -644,17 +766,24 @@ class OpenCodeClient:
                 payload = anthropic_to_opencode_payload(anthropic_req, free_tier_markers_on_wire=anonymous)
                 payload["stream"] = True
                 payload["stream_options"] = {"include_usage": True}
+                # Without this line the trim is invisible: a later reader cannot tell whether it runs.
+                sent = sum(_message_size(m) for m in payload["messages"])
+                asked = sum(len(str(m.get("content") or "")) for m in anthropic_req.get("messages") or [])
+                if asked > sent:
+                    log(f"[OpenCode] [Req #{req_id}] context trimmed {asked - sent:,} chars "
+                        f"of {asked:,} before dispatch", level="DEBUG")
                 # Claude Code always asks for its own max_tokens; the catalogue knows the real cap.
                 if cap and payload.get("max_completion_tokens", 0) > cap:
                     payload["max_completion_tokens"] = cap
                 if anonymous:
-                    # The free tier is only served to a request that advertises the tool names the
-                    # opencode client uses. Claude Code sends Bash and Read, so the markers are
-                    # copies of them; a request without either is refused, and says so here first.
-                    missing = missing_free_tier_tools(payload.get("tools") or [])
+                    # Markers are already on the wire, so this asks what the turn would have sent
+                    # without them: a client whose own tools cannot answer a reserved name is a turn
+                    # the model may call into a tool the harness does not run.
+                    missing = missing_free_tier_tools(
+                        [t for t in (payload.get("tools") or []) if t["function"]["name"] not in RESERVED_TOOL_NAMES])
                     if missing:
-                        log(f"[OpenCode] anonymous turn has no tool to answer {', '.join(missing)}; "
-                            "Zen will refuse the free tier", level="WARN")
+                        log(f"[OpenCode] [Req #{req_id}] anonymous turn carries no tool to answer {', '.join(missing)}; "
+                            "the reserved names go out with an empty schema", level="DEBUG")
                 if SAVE_DETAILED_REQUEST_LOGS and req_id:
                     _save_payload(req_id, payload)
 
@@ -687,7 +816,7 @@ class OpenCodeClient:
                     detail = await _safe_text(response)
                     response.release()
                     last_error = self._account_error(response.status, detail, account, model_name)
-                    log(f"[OpenCode] {last_error[1]}", level="WARN")
+                    log(f"[OpenCode] [Req #{req_id}] {last_error[1]}", level="WARN")
                     continue
 
                 try:

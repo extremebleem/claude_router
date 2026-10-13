@@ -13,7 +13,7 @@ import secrets
 import re
 import logging
 from pathlib import Path
-from typing import Optional, AsyncGenerator
+from typing import Optional, AsyncGenerator, Dict
 from aiohttp import web, ClientSession
 from aiohttp.web_exceptions import HTTPRequestEntityTooLarge
 
@@ -39,6 +39,7 @@ from backend.gemini_api import GeminiApiClient
 from transformer.signatures import signature_cache
 from transformer.streamer import parse_google_sse_stream, aggregate_sse_stream_to_json
 from transformer.tokenizer import estimate_request_tokens
+from transformer.search import format_search_results, perform_web_search
 
 
 def _format_wait_duration(seconds: float) -> str:
@@ -238,6 +239,11 @@ CLIENT_DISCONNECT_ERRORS = (
     asyncio.CancelledError,
 )
 
+# The proxy-side WebSearch handler. Both bound the search: the timeout so a hung provider cannot
+# hold the connection empty, the length so a pasted block cannot become the query string.
+SEARCH_TIMEOUT_SECONDS = 8.0
+SEARCH_QUERY_MAX_CHARS = 500
+
 
 class SuppressDisconnectFilter(logging.Filter):
     """Suppresses harmless client disconnect tracebacks from aiohttp server logs."""
@@ -309,6 +315,10 @@ class ProxyApp:
         self.opencode_client = OpenCodeClient(token_manager)
         self.router = ProviderRouter(self.antigravity_client, self.opencode_client, token_manager)
         self.http_session: Optional[ClientSession] = None
+        # The model each session is actually using, keyed by session id. Auxiliary calls (titles,
+        # classifier, compaction) are answered by it instead of by a separate small model, so one
+        # session costs one model.
+        self.active_model: Dict[str, str] = {}
         self._models_cache = None
         self._models_cache_time = 0
         self.total_requests = 0
@@ -563,6 +573,104 @@ class ProxyApp:
             log(f"[Classifier Stub] [Req #{req_id}] ℹ Client disconnected / aborted request early.", level="DEBUG")
         return response
 
+    # A Zen turn that advertises nothing but a web search is answered here instead of being
+    # forwarded. Zen's free tier only serves requests carrying bash+read
+    # (transformer/opencode_tool_alias.py), so a search-only turn gets 403 FreeTierError before the
+    # model ever sees it. Searching in the proxy also costs no model tokens. Antigravity keeps its
+    # own grounding, which is why the check is provider-scoped: `gemini-*-search` reaches
+    # transformer/content.py and its googleSearch tool instead of this handler.
+    def is_search_only_request(self, model: str, body: dict) -> bool:
+        if self.router.resolve_provider(model) != "opencode":
+            return False
+        tools = [t for t in body.get("tools") or [] if isinstance(t, dict)]
+        return bool(tools) and all("search" in str(t.get("name") or t.get("type") or "").lower()
+                                   for t in tools)
+
+    async def handle_search_only_request(self, request: web.Request, body: dict,
+                                          raw_model: str, stream: bool, req_id: str):
+        """Runs the client's WebSearch tool here and answers with its result, never forwarding the turn."""
+        query = self._search_query_from(body)
+        results = []
+        if query:
+            # The providers are synchronous with their own timeouts; without one the connection sits
+            # empty for the length of both attempts, which reads as a hung client.
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.to_thread(perform_web_search, query, 5), timeout=SEARCH_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                log(f"[Req #{req_id}] WebSearch timed out after {SEARCH_TIMEOUT_SECONDS}s", level="WARN")
+        text = format_search_results(query, results) if query else "Web search requires a query."
+        log(f"[Req #{req_id}] WebSearch answered by the proxy ({len(results)} results for '{query}')", level="INFO")
+
+        message = {
+            "id": f"msg_search_{secrets.token_hex(12)}",
+            "type": "message",
+            "role": "assistant",
+            "model": raw_model,
+            "content": [{"type": "text", "text": text}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }
+        if not stream:
+            return web.json_response(message)
+
+        response = web.StreamResponse(status=200, headers={
+            "Content-Type": "text/event-stream; charset=utf-8",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        })
+        try:
+            await response.prepare(request)
+            for evt in [
+                # message_start carries no stop_reason and no usage; message_delta closes them.
+                {"type": "message_start", "message": {
+                    "id": message["id"], "type": "message", "role": "assistant", "model": raw_model,
+                    "content": [], "stop_reason": None, "stop_sequence": None,
+                    "usage": {"input_tokens": 0, "output_tokens": 0}}},
+                {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}},
+                {"type": "content_block_stop", "index": 0},
+                {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                 "usage": {"output_tokens": 0}},
+                {"type": "message_stop"},
+            ]:
+                await response.write(f"event: {evt['type']}\ndata: {json.dumps(evt)}\n\n".encode("utf-8"))
+            await response.write_eof()
+        except CLIENT_DISCONNECT_ERRORS:
+            log(f"[Req #{req_id}] Client disconnected during the search answer.", level="DEBUG")
+        return response
+
+    @staticmethod
+    def _search_query_from(body: dict) -> str:
+        """The query the model asked for, not the whole prompt.
+
+        Once the model has called the tool, the query is in the preceding assistant message's
+        tool_use input; the user turn that follows carries only a tool_result with no text of its
+        own. Falling back to the prompt itself would send every system-reminder along with it.
+        """
+        for message in reversed(body.get("messages") or []):
+            content = message.get("content")
+            if message.get("role") != "assistant":
+                continue
+            for block in content if isinstance(content, list) else []:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    query = (block.get("input") or {}).get("query")
+                    if isinstance(query, str) and query.strip():
+                        return query.strip()[:SEARCH_QUERY_MAX_CHARS]
+        for message in reversed(body.get("messages") or []):
+            if message.get("role") != "user":
+                continue
+            text = message.get("content")
+            if isinstance(text, list):
+                # A tool_result turn has no text of its own; skip it rather than search the prompt.
+                text = " ".join(b.get("text", "") for b in text
+                                if isinstance(b, dict) and b.get("type") == "text")
+            if isinstance(text, str) and text.strip():
+                return text.strip()[:SEARCH_QUERY_MAX_CHARS]
+        return ""
+
     def is_state_classifier_request(self, request: web.Request, body: dict) -> bool:
         """
         Detects if request is an auto-mode state / notification classifier check
@@ -814,6 +922,24 @@ class ProxyApp:
         raw_model = body.get("model", "claude-opus-4-6-thinking")
         enable_google_search = "-search" in raw_model.lower() or bool(body.get("google_search")) or bool(body.get("web_search"))
         model = MODEL_ALIASES.get(raw_model.lower(), raw_model)
+
+        # Claude Code labels its side calls (titles, classifier, compaction) in this header. They name
+        # a small model the client keeps for them, but the session's own model answers them instead, so
+        # a session costs one model and a Zen session gets the names its free tier insists on.
+        req_class = request.headers.get("x-claude-code-request-class", "").lower()
+        is_auxiliary = req_class == "auxiliary"
+        # Keyed per session, not one process-wide slot: with two clients in flight a global would
+        # answer each session's titles from whichever model spoke last.
+        session_key = (request.headers.get("x-claude-code-session-id")
+                       or (body.get("metadata") or {}).get("user_id")
+                       or self.session_auth_token or "default")
+        if is_auxiliary and self.active_model.get(session_key):
+            session_model = self.active_model[session_key]
+            log(f"[Req #{req_id}] Auxiliary call rerouted from '{raw_model}' to the session model "
+                f"'{session_model}'", level="INFO")
+            model = session_model
+            raw_model = session_model
+
         body["model"] = model
         if enable_google_search:
             body["enable_google_search"] = True
@@ -834,6 +960,13 @@ class ProxyApp:
 
         tools_count = len(body.get("tools", [])) if isinstance(body.get("tools"), list) else 0
         log(f"[Req #{req_id}] Request /v1/messages: model={model} (raw={raw_model}), stream={stream}, msgs={len(messages)}, tools={tools_count}")
+
+        # A main-thread turn is the conversation itself, so its model is the session's model. An auxiliary
+        # call must not overwrite it, or the session model flickers to whatever side task the client
+        # asked for. The client marks auxiliary calls in the header; the empty tool list is only a
+        # second signal, because some side calls (compaction) still carry the full tool set.
+        if not is_auxiliary:
+            self.active_model[session_key] = model
 
         # 1. Check for Auto Mode State / Notification Classifier check -> Return instant working stub
         if self.is_state_classifier_request(request, body):
@@ -865,6 +998,13 @@ class ProxyApp:
             if len(self.recent_events) > 50:
                 self.recent_events.pop()
             return await self.handle_classifier_stub(request, raw_model, stream, req_id, dangerous_match=dangerous_cmd)
+
+        # 3. Zen WebSearch-only turn -> the proxy searches, the model is never billed for it.
+        if self.is_search_only_request(model, body):
+            result = await self.handle_search_only_request(request, body, raw_model, stream, req_id)
+            # Recorded after the search ran, so the latency is the search's and not the dispatch's.
+            self.record_event(req_id, model, "proxy-websearch", stream, 200, t_start, "proxy-websearch")
+            return result
 
         if self.router.resolve_provider(model) == "opencode":
             return await self.handle_opencode_messages(request, body, stream, req_id)
