@@ -202,8 +202,13 @@ def main():
     parser = argparse.ArgumentParser(description="Authentication & Multi-Account Pool Manager for Claude-Gemini Proxy")
     subparsers = parser.add_subparsers(dest="command")
 
-    subparsers.add_parser("login", help="Interactive Google OAuth login via browser")
-    subparsers.add_parser("add", help="Add another Google account to pool")
+    p_login = subparsers.add_parser("login", help="Interactive OAuth login via browser")
+    p_login.add_argument("--provider", choices=["google", "opencode"], default="google", help="Provider to login with (default: google)")
+
+    p_add = subparsers.add_parser("add", help="Add another account to pool")
+    p_add.add_argument("--provider", choices=["google", "opencode"], default="google", help="Provider to add account for (default: google)")
+
+    subparsers.add_parser("login-opencode", help="Login to OpenCode via device flow")
     subparsers.add_parser("status", help="Check active session status")
     subparsers.add_parser("list", help="List stored accounts")
     subparsers.add_parser("pool", help="Show accounts pool status, cooldowns, and quotas")
@@ -223,7 +228,17 @@ def main():
     manager = TokenManager()
 
     if args.command in ("login", "add"):
-        cmd_login(manager)
+        provider = getattr(args, "provider", "google")
+        if provider == "opencode":
+            import asyncio
+            from auth.opencode_oauth import login_opencode_flow
+            asyncio.run(login_opencode_flow(manager))
+        else:
+            cmd_login(manager)
+    elif args.command == "login-opencode":
+        import asyncio
+        from auth.opencode_oauth import login_opencode_flow
+        asyncio.run(login_opencode_flow(manager))
     elif args.command == "status":
         cmd_status(manager)
     elif args.command == "list":
