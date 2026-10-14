@@ -14,7 +14,7 @@ import re
 import logging
 from pathlib import Path
 from typing import Optional, AsyncGenerator, Dict
-from aiohttp import web, ClientSession
+from aiohttp import web, ClientSession, ClientTimeout
 from aiohttp.web_exceptions import HTTPRequestEntityTooLarge
 
 # Fix utf-8 output on Windows
@@ -835,7 +835,9 @@ class ProxyApp:
             status = OPENCODE_ERROR_STATUS.get(error_body["error"].get("type"), 500)
             await chunks.aclose()
             self.record_event(req_id, model, account, stream, status, t_start, "opencode")
-            return web.json_response(error_body, status=status)
+            retry_after = error_body.pop("retry_after", None)
+            return web.json_response(error_body, status=status,
+                                     headers={"retry-after": str(retry_after)} if retry_after else None)
 
         if not stream:
             status, message = await fold_sse_to_message(_prepend_chunk(first, chunks))
@@ -871,6 +873,8 @@ class ProxyApp:
             log(f"[Req #{req_id}] ℹ Client disconnected / aborted request early.", level="DEBUG")
         finally:
             self.record_event(req_id, model, account, True, outcome["status"], t_start, "opencode")
+            # Closing the generator releases the upstream connection when the client left early
+            await chunks.aclose()
         return response
 
     async def get_backend_stream(self, body: dict, req_id: Optional[str] = None):
@@ -1525,7 +1529,9 @@ async def run_server(host: str = "127.0.0.1", port: int = 8080, session_auth_tok
     token_manager = TokenManager()
     proxy = ProxyApp(token_manager, session_auth_token=session_auth_token)
 
-    async with ClientSession() as session:
+    # The default timeout caps a whole request at 5 minutes, which cuts a long model stream in the
+    # middle. Only silence is bounded here: a stalled connection dies, a slow one is left alone.
+    async with ClientSession(timeout=ClientTimeout(total=None, sock_connect=30, sock_read=300)) as session:
         proxy.set_http_session(session)
         runner = web.AppRunner(proxy.app)
         await runner.setup()

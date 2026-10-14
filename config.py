@@ -98,7 +98,8 @@ TOOL_RESULT_TAIL_CHARS = 600
 
 # Tool results replayed from history. Claude Code re-sends every past tool message on every turn,
 # and Zen does not cache, so an old 9 KB read cost 2.4 MB of upstream traffic across 255 turns.
-# Only the most recent TOOL_HISTORY_KEEP tool results survive; the rest become one marker message.
+# Only the most recent TOOL_HISTORY_KEEP tool results keep their output; older ones keep the call and
+# carry a stub result, so the model still sees that it ran them.
 TOOL_HISTORY_KEEP = int(os.environ.get("PROXY_TOOL_HISTORY_KEEP", "8"))
 
 # Whole-conversation budget for a Zen turn. Zen does not cache, so the input grows with every

@@ -11,7 +11,10 @@ from pathlib import Path
 
 LOGS_DIR = Path(__file__).parent / "logs"
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = LOGS_DIR / "proxy.log"
+# Test runs log to their own file: they feed fake accounts through the same code, and mixed into
+# proxy.log those lines read like real failures (a@b rate limited, user1@example.com exhausted).
+_RUNNING_TESTS = any(name in sys.argv[0] for name in ("unittest", "pytest"))
+LOG_FILE = LOGS_DIR / ("test.log" if _RUNNING_TESTS else "proxy.log")
 
 _quiet_mode = os.environ.get("PROXY_QUIET", "0") == "1"
 

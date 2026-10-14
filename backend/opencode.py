@@ -40,6 +40,8 @@ from transformer.opencode_prompts import (
 DEFAULT_ZEN_MODEL = "space-bunny-free"
 REQUEST_TIMEOUT_SECONDS = 300
 DEFAULT_COOLDOWN_SECONDS = 600.0
+# Zen answers a spent free quota with Retry-After in the hours; honoured, but not beyond a day.
+MAX_COOLDOWN_SECONDS = 86400.0
 
 # What the opencode client itself sends when nobody is logged in
 # (packages/core/src/plugin/provider/opencode.ts: with no credential the provider is given the literal
@@ -164,33 +166,45 @@ def _tool_result_text(part: Dict[str, Any]) -> str:
     if len(text) > TOOL_RESULT_MAX_CHARS:
         dropped = len(text) - TOOL_RESULT_MAX_CHARS
         text = (text[:TOOL_RESULT_MAX_CHARS]
-                + f"\n... [{dropped} characters cut. The full output is in the tool result "
-                  f"above the tail.]\n" + text[-TOOL_RESULT_TAIL_CHARS:])
+                + f"\n... [{dropped} characters cut from the middle of this output] ...\n"
+                + text[-TOOL_RESULT_TAIL_CHARS:])
     if part.get("is_error"):
         return f"Error: {text}" if text else "Error"
     return text
 
 
-def _drop_unpaired_tool_calls(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Keeps an assistant tool_calls turn only when every call it made has a result in this request.
+# What the model reads in place of content that was left out. Each says what happened and what to do,
+# so a gap is read as history that is no longer shown and not as something to fill in by guessing.
+OMITTED_RESULT = ("[Output omitted to keep the context small. The call above did run; "
+                  "run it again if you need its output.]")
+MISSING_RESULT = "[No result was recorded for this call. Treat its outcome as unknown and check before relying on it.]"
+HISTORY_CUT_NOTE = ("<context-summary>\nThis conversation is longer than the window. Its first {n} messages "
+                    "are not shown. Do not guess what they said or did; if you need something from them, "
+                    "ask the user or read the files again.\n</context-summary>")
 
-    Zen rejects a tool message whose tool_call_id has no tool_calls entry ahead of it, and a result
-    whose issuing turn is missing (a resumed session sends those). Both are dropped as a unit, so a
-    turn and its results always travel together or not at all.
+
+def _repair_tool_pairs(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Makes every assistant tool_calls turn followed by exactly one result per call.
+
+    Zen rejects a tool message whose tool_call_id has no tool_calls entry ahead of it (a resumed
+    session sends those), and a call left without a result. Orphan results are dropped; a call with
+    no result keeps its place and gets a stub result, so the model still knows it made the call.
     """
     out: List[Dict[str, Any]] = []
     i, n = 0, len(messages)
     while i < n:
         m = messages[i]
         if m.get("role") == "assistant" and m.get("tool_calls"):
-            calls = {c["id"] for c in m["tool_calls"]}
+            calls = [c["id"] for c in m["tool_calls"]]
             j, results = i + 1, []
             while j < n and messages[j].get("role") == "tool":
-                results.append(messages[j])
+                if messages[j].get("tool_call_id") in calls:
+                    results.append(messages[j])
                 j += 1
-            if calls <= {r.get("tool_call_id") for r in results}:
-                out.append(m)
-                out.extend(results)
+            have = {r.get("tool_call_id") for r in results}
+            out.append(m)
+            out.extend(results)
+            out.extend({"role": "tool", "tool_call_id": c, "content": MISSING_RESULT} for c in calls if c not in have)
             i = j
             continue
         if m.get("role") != "tool":
@@ -204,75 +218,53 @@ def _message_size(m: Dict[str, Any]) -> int:
 
 
 def trim_tool_history(messages: List[Dict[str, Any]], keep_last: int, max_chars: int) -> List[Dict[str, Any]]:
-    """Drops replayed tool results that are far enough back, keeping the pairing intact.
+    """Bounds what a long session replays, without hiding from the model that something happened.
 
-    Claude Code re-sends every past tool message on every turn and Zen bills each one, so a session
-    pays for its whole output history again and again. max_chars additionally bounds everything left.
+    Claude Code re-sends every past message on every turn and Zen bills each one. Two steps, both
+    leaving the system blocks alone (they are the model's instructions and tool list):
+      * tool results older than the last keep_last are replaced by a stub; the call stays, so the
+        model keeps the record of what it did and does not repeat or invent it.
+      * if the rest still exceeds max_chars, the oldest turns go, whole (a tool_calls turn travels
+        with its results), and one note says that the start of the conversation is not shown.
     """
-    messages = _drop_unpaired_tool_calls(messages)
+    head = 0
+    while head < len(messages) and messages[head].get("role") == "system":
+        head += 1
+    system, body = messages[:head], _repair_tool_pairs(messages[head:])
 
-    # A tool_calls turn and the results answering it are one unit; a unit is dropped whole.
-    units: List[List[Dict[str, Any]]] = []
-    cur: Optional[List[Dict[str, Any]]] = None
-    for m in messages:
-        if m.get("role") == "assistant" and m.get("tool_calls"):
-            if cur:
-                units.append(cur)
-            cur = [m]
-        elif m.get("role") == "tool" and cur is not None:
-            cur.append(m)
+    if keep_last >= 0:
+        results = [m for m in body if m.get("role") == "tool"]
+        for m in results[:max(0, len(results) - keep_last)]:
+            m["content"] = OMITTED_RESULT
+
+    # Turns, oldest first: a tool_calls message and its results are one turn.
+    turns: List[List[Dict[str, Any]]] = []
+    for m in body:
+        if m.get("role") == "tool" and turns:
+            turns[-1].append(m)
         else:
-            if cur:
-                units.append(cur)
-                cur = None
-            units.append([m])
-    if cur:
-        units.append(cur)
+            turns.append([m])
 
-    dropped_tool = 0
-    tool_units = [u for u in units if any(m.get("role") == "tool" for m in u)]
-    drop = max(0, len(tool_units) - keep_last) if keep_last >= 0 else 0
-    kept_units: List[List[Dict[str, Any]]] = []
-    for u in units:
-        if drop > 0 and u[0].get("role") == "assistant" and u[0].get("tool_calls"):
-            dropped_tool += sum(1 for m in u if m.get("role") == "tool")
-            drop -= 1
-            continue
-        kept_units.append(u)
-    messages = [m for u in kept_units for m in u]
-
-    dropped_turns = 0
-    if max_chars > 0 and sum(_message_size(m) for m in messages) > max_chars:
-        head: List[Dict[str, Any]] = []
-        running = 0
-        cut = 0
-        for i in range(len(messages) - 1, -1, -1):
-            if running + _message_size(messages[i]) > max_chars and head:
-                cut = i + 1
-                break
-            head.insert(0, messages[i])
-            running += _message_size(messages[i])
+    budget = max_chars - sum(_message_size(m) for m in system)
+    cut = 0
+    if max_chars > 0:
+        total = sum(_message_size(m) for m in body)
+        while cut < len(turns) - 1 and total > budget:
+            total -= sum(_message_size(m) for m in turns[cut])
+            cut += 1
+        # After a cut the kept history starts on a user turn, as a conversation does
+        while cut and cut < len(turns) - 1 and turns[cut][0].get("role") != "user":
+            cut += 1
+    kept = [m for t in turns[cut:] for m in t]
+    if cut:
+        dropped = sum(len(t) for t in turns[:cut])
+        note = HISTORY_CUT_NOTE.format(n=dropped)
+        first = kept[0] if kept else None
+        if first and first.get("role") == "user" and isinstance(first.get("content"), str):
+            kept[0] = {**first, "content": f"{note}\n{first['content']}"}
         else:
-            cut = 0
-        # Never start the kept history on a tool result whose issuing turn was cut.
-        while cut < len(messages) and messages[cut].get("role") == "tool":
-            cut -= 1
-        dropped_turns = cut
-        messages = messages[cut:]
-
-    out = list(messages)
-    if dropped_tool or dropped_turns:
-        notes: List[str] = []
-        if dropped_tool:
-            notes.append(f"{dropped_tool} earlier tool results were omitted; their output is still "
-                         f"in the session transcript if it is needed again")
-        if dropped_turns:
-            notes.append(f"{dropped_turns} earlier turns of this conversation were omitted for the "
-                         f"same reason")
-        # Marked rather than left silent, so the model reads the gap as history and not as absence.
-        out.insert(0, {"role": "user",
-                       "content": "<context-summary>\n" + "\n".join(notes) + "\n</context-summary>"})
-    return out
+            kept.insert(0, {"role": "user", "content": note})
+    return system + kept
 
 
 def _image_part(block: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -506,8 +498,19 @@ def _sse(event: str, data: Dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
-def _error(kind: str, message: str) -> str:
-    return _sse("error", {"type": "error", "error": {"type": kind, "message": message}})
+def _error(kind: str, message: str, retry_after: Optional[float] = None) -> str:
+    data: Dict[str, Any] = {"type": "error", "error": {"type": kind, "message": message}}
+    if retry_after:
+        # Not part of Anthropic's error body; the server turns it into the Retry-After header
+        data["retry_after"] = int(retry_after)
+    return _sse("error", data)
+
+
+def parse_retry_after(value: Optional[str]) -> Optional[float]:
+    """Seconds from a Retry-After header, bounded; None when absent or an HTTP date."""
+    if value and value.strip().isdigit():
+        return min(float(value), MAX_COOLDOWN_SECONDS)
+    return None
 
 
 def _save_payload(req_id: str, payload: Dict[str, Any]) -> None:
@@ -657,9 +660,18 @@ class OpenCodeClient:
             accounts = self.token_manager.get_available_accounts(
                 model_name, provider="opencode", allow_cooldown_fallback=False
             )
-        if not accounts and is_free_tier_model(model_name):
+        # The anonymous turn is not a stored account, so its cooldown is looked up by id. Without
+        # this check a throttled free tier was sent to Zen again on every retry of the client.
+        if not accounts and is_free_tier_model(model_name) and self._anonymous_wait(model_name) <= 0:
             return [ANONYMOUS_ACCOUNT]
         return accounts
+
+    def _anonymous_wait(self, model_name: str) -> float:
+        """Seconds until the anonymous free tier may be tried again for this model; 0 when it may."""
+        if not self.token_manager:
+            return 0.0
+        cooling = self.token_manager.get_exhausted_status().get(_account_id(ANONYMOUS_ACCOUNT), {})
+        return max((wait for key, wait in cooling.items() if key in ("*", model_name)), default=0.0)
 
     def _request_headers(self, token: str, anthropic_req: Dict[str, Any],
                          catalog: Optional[Dict[str, Any]] = None,
@@ -689,7 +701,7 @@ class OpenCodeClient:
         return headers
 
     def _account_error(self, status: int, detail: str, account: Dict[str, Any],
-                       model_name: str) -> Tuple[str, str]:
+                       model_name: str, retry_after: Optional[float] = None) -> Tuple[str, str]:
         """Maps an upstream failure onto an Anthropic error and cools the account down where that
         helps. Cooldowns are per model, so one throttled model does not mute the rest of the pool."""
         kind = HTTP_STATUS_ERRORS.get(status, "api_error")
@@ -701,7 +713,7 @@ class OpenCodeClient:
             return policy[0], f"OpenCode refused {model_name} for {ident}: {policy[1]}"
         if status == 429:
             self.token_manager.mark_account_cooldown(
-                ident, cooldown_seconds=DEFAULT_COOLDOWN_SECONDS, model=model_name, provider="opencode"
+                ident, cooldown_seconds=retry_after or DEFAULT_COOLDOWN_SECONDS, model=model_name, provider="opencode"
             )
             return "rate_limit_error", f"OpenCode 429 rate limit for {model_name} on {ident}: {detail}"
         if status in (401, 403):
@@ -723,13 +735,13 @@ class OpenCodeClient:
         model_name = zen_model_id(anthropic_req.get("model"))
         accounts = self._candidate_accounts(model_name)
         if not accounts:
-            wait = self.token_manager.cooldown_remaining("opencode", model_name) if self.token_manager else 0.0
+            wait = max(self.token_manager.cooldown_remaining("opencode", model_name) if self.token_manager else 0.0,
+                       self._anonymous_wait(model_name))
             if wait > 0:
+                # Answered locally: Zen is not contacted again until the cooldown is over
                 yield _error("rate_limit_error",
-                             f"All OpenCode accounts are rate limited for {model_name}; retry in {int(wait)}s")
+                             f"OpenCode is rate limited for {model_name}; retry in {int(wait)}s", wait)
             elif is_free_tier_model(model_name):
-                # Only a cooldown can have emptied the pool here; without one the free models run
-                # anonymously. Kept distinct so the reason is never guessed at from the outside.
                 yield _error("rate_limit_error",
                              f"OpenCode free models are temporarily unavailable for {model_name}; retry shortly")
             else:
@@ -746,10 +758,12 @@ class OpenCodeClient:
         msg_id = message_identifier(f"{req_id or 'stream'}:{time.time_ns()}")
         owned_session = self.http_session
         if owned_session is None:
-            owned_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS))
+            owned_session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=REQUEST_TIMEOUT_SECONDS))
 
         try:
             last_error: Optional[Tuple[str, str]] = None
+            last_retry_after: Optional[float] = None
             for account in accounts:
                 # Anonymous turns carry the literal "public" token and never touch the pool; a real
                 # account refreshes, which is a blocking HTTP call, so keep it off the event loop.
@@ -800,8 +814,7 @@ class OpenCodeClient:
                         continue
                     if response.status == 429 and self.proxy_pool.has_alternative(route):
                         # This IP is out of quota; the same turn goes out through the next one
-                        retry_after = response.headers.get("Retry-After", "")
-                        self.proxy_pool.mark_limited(route, float(retry_after) if retry_after.isdigit() else None)
+                        self.proxy_pool.mark_limited(route, parse_retry_after(response.headers.get("Retry-After")))
                         last_error = ("rate_limit_error", f"OpenCode 429 via {mask_proxy(route)}")
                         response.release()
                         response = None
@@ -815,8 +828,11 @@ class OpenCodeClient:
                 if response.status != 200:
                     detail = await _safe_text(response)
                     response.release()
-                    last_error = self._account_error(response.status, detail, account, model_name)
-                    log(f"[OpenCode] [Req #{req_id}] {last_error[1]}", level="WARN")
+                    last_retry_after = (
+                        parse_retry_after(response.headers.get("Retry-After")) if response.status == 429 else None)
+                    last_error = self._account_error(response.status, detail, account, model_name, last_retry_after)
+                    log(f"[OpenCode] [Req #{req_id}] {last_error[1]}"
+                        + (f" (retry after {int(last_retry_after)}s)" if last_retry_after else ""), level="WARN")
                     continue
 
                 try:
@@ -829,7 +845,7 @@ class OpenCodeClient:
                 return
 
             kind, message = last_error or ("api_error", "OpenCode: no usable account")
-            yield _error(kind, message)
+            yield _error(kind, message, last_retry_after if kind == "rate_limit_error" else None)
         finally:
             if self.http_session is None:
                 await owned_session.close()
@@ -873,6 +889,19 @@ class OpenCodeClient:
         tool_blocks: Dict[int, int] = {}  # upstream tool_call index -> anthropic block index
         stop_reason = "end_turn"
         usage = {"input_tokens": 0, "output_tokens": 0}
+        finished = False  # a finish_reason or [DONE] arrived: the model really ended its turn
+
+        def close_open_block() -> List[str]:
+            if open_block is None:
+                return []
+            events = []
+            if open_kind == "thinking":
+                events.append(_sse("content_block_delta", {
+                    "type": "content_block_delta", "index": open_block,
+                    "delta": {"type": "signature_delta", "signature": _dummy_signature(msg_id, open_block)},
+                }))
+            events.append(_sse("content_block_stop", {"type": "content_block_stop", "index": open_block}))
+            return events
 
         def switch_block(kind: str, content_block: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
             """Events needed to move the stream onto a block of `kind`, closing the previous one.
@@ -906,11 +935,22 @@ class OpenCodeClient:
                 continue
             data_str = line_str[5:].strip()
             if data_str == "[DONE]":
+                finished = True
                 break
             try:
                 chunk = json.loads(data_str)
             except ValueError:
                 continue
+            if chunk.get("error"):
+                # An error in the middle of a stream is not an empty answer. Reporting it as one
+                # lets the client take a half-written reply for a finished turn.
+                err = chunk["error"]
+                text = err.get("message") if isinstance(err, dict) else str(err)
+                for event in close_open_block():
+                    yield event
+                kind = "rate_limit_error" if "rate limit" in (text or "").lower() else "api_error"
+                yield _error(kind, f"OpenCode stream error: {text}")
+                return
             if chunk.get("usage"):
                 usage = {
                     "input_tokens": chunk["usage"].get("prompt_tokens", 0),
@@ -962,15 +1002,16 @@ class OpenCodeClient:
 
             finish = choices[0].get("finish_reason")
             if finish:
+                finished = True
                 stop_reason = STOP_REASONS.get(finish, "end_turn")
 
-        if open_block is not None:
-            if open_kind == "thinking":
-                yield _sse("content_block_delta", {
-                    "type": "content_block_delta", "index": open_block,
-                    "delta": {"type": "signature_delta", "signature": _dummy_signature(msg_id, open_block)},
-                })
-            yield _sse("content_block_stop", {"type": "content_block_stop", "index": open_block})
+        for event in close_open_block():
+            yield event
+        if not finished:
+            # The connection ended mid-turn. A normal message_stop here would make a cut-off reply,
+            # or a tool call with half its arguments, look like the model's finished answer.
+            yield _error("api_error", "OpenCode stream ended before the model finished its turn")
+            return
         yield _sse("message_delta", {
             "type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None}, "usage": usage,
         })

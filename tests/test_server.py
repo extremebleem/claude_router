@@ -580,6 +580,25 @@ class TestServerEndpoints(AioHTTPTestCase):
             self.assertEqual(data["content"], [{"type": "text", "text": "Привет"}])
             self.assertEqual(data["stop_reason"], "end_turn")
 
+    @unittest_run_loop
+    async def test_zen_rate_limit_reaches_the_client_as_http_429_with_retry_after(self):
+        import json
+        error = {"type": "error", "error": {"type": "rate_limit_error", "message": "limit"}, "retry_after": 7200}
+
+        def fake_stream(body, headers=None, req_id=None):
+            async def gen():
+                yield f"event: error\ndata: {json.dumps(error)}\n\n"
+            return gen()
+
+        headers = {"Authorization": "Bearer secret_sandbox_token"}
+        body = {"model": "space-bunny-free", "messages": [{"role": "user", "content": "hi"}]}
+        with patch.object(self.proxy.opencode_client, "generate_stream", side_effect=fake_stream):
+            for stream in (True, False):
+                resp = await self.client.post("/v1/messages", json={**body, "stream": stream}, headers=headers)
+                self.assertEqual(resp.status, 429)
+                self.assertEqual(resp.headers["retry-after"], "7200")
+                self.assertNotIn("retry_after", await resp.json())
+
 
 if __name__ == "__main__":
     unittest.main()

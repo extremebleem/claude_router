@@ -56,8 +56,9 @@ def sse_lines(chunks):
 
 
 class FakeResponse:
-    def __init__(self, status=200, lines=None, body=""):
+    def __init__(self, status=200, lines=None, body="", headers=None):
         self.status = status
+        self.headers = headers or {}
         self._lines = lines or []
         self._body = body
         self.released = False
@@ -394,6 +395,80 @@ class TestSystemTurnLowering(unittest.TestCase):
         roles = [m["role"] for m in msgs]
         self.assertEqual(roles, ["assistant", "tool", "user"])
         self.assertIn("budget note", msgs[-1]["content"])
+
+
+class TestRetryAfterAndAnonymousCooldown(unittest.IsolatedAsyncioTestCase):
+    """The log of a real session showed the throttled free tier being sent to Zen on every retry."""
+
+    @staticmethod
+    def anonymous_tm(exhausted=None):
+        tm = make_token_manager([])
+        tm.get_exhausted_status.return_value = exhausted or {}
+        return tm
+
+    async def test_retry_after_sets_the_account_cooldown(self):
+        session = FakeSession([FakeResponse(429, body="limit", headers={"Retry-After": "7200"})])
+        tm = make_token_manager([{"email": "a@b"}])
+        client = OpenCodeClient(tm, http_session=session)
+        status, body = await fold_sse_to_message(client.generate_stream({"model": "m", "messages": []}))
+        self.assertEqual(status, 429)
+        self.assertEqual(tm.mark_account_cooldown.call_args.kwargs["cooldown_seconds"], 7200)
+        self.assertEqual(body["retry_after"], 7200)
+
+    async def test_retry_after_is_bounded_and_ignores_http_dates(self):
+        from backend.opencode import MAX_COOLDOWN_SECONDS, parse_retry_after
+        self.assertEqual(parse_retry_after("999999999"), MAX_COOLDOWN_SECONDS)
+        self.assertIsNone(parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT"))
+        self.assertIsNone(parse_retry_after(None))
+
+    async def test_cooling_anonymous_tier_is_not_sent_to_zen_again(self):
+        session = FakeSession([FakeResponse(200, sse_lines([]))])
+        tm = self.anonymous_tm({"public@opencode": {"space-bunny-free": 500.0}})
+        client = OpenCodeClient(tm, http_session=session)
+        status, body = await fold_sse_to_message(client.generate_stream(
+            {"model": "space-bunny-free", "messages": [{"role": "user", "content": "x"}]}))
+        self.assertEqual(status, 429)
+        self.assertEqual(session.sent, [])
+        self.assertEqual(body["retry_after"], 500)
+        self.assertIn("retry in 500s", body["error"]["message"])
+
+    async def test_anonymous_tier_runs_once_its_cooldown_is_over(self):
+        session = FakeSession([FakeResponse(200, sse_lines([{"choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}]}]))])
+        client = OpenCodeClient(self.anonymous_tm({"public@opencode": {"other-model": 500.0}}), http_session=session)
+        status, _ = await fold_sse_to_message(client.generate_stream(
+            {"model": "space-bunny-free", "messages": [{"role": "user", "content": "x"}]}))
+        self.assertEqual((status, len(session.sent)), (200, 1))
+
+
+class TestStreamEndings(unittest.IsolatedAsyncioTestCase):
+    """A stream that stops early or fails midway must reach the client as an error, not as an answer."""
+
+    @staticmethod
+    async def events(raw_lines):
+        client = OpenCodeClient(make_token_manager([{"email": "a@b"}]),
+                                http_session=FakeSession([FakeResponse(200, raw_lines)]))
+        return [c async for c in client.generate_stream({"model": "m", "messages": []})]
+
+    async def test_stream_cut_before_finish_is_an_error_not_end_turn(self):
+        chunks = await self.events([b'data: {"choices": [{"delta": {"content": "half a sent"}}]}\n'])
+        self.assertTrue(chunks[-1].startswith("event: error"))
+        self.assertFalse(any("message_stop" in c for c in chunks))
+        self.assertIn("ended before the model finished", chunks[-1])
+
+    async def test_error_chunk_inside_the_stream_is_reported(self):
+        chunks = await self.events([
+            b'data: {"choices": [{"delta": {"content": "start"}}]}\n',
+            b'data: {"error": {"message": "Rate limit exceeded"}}\n',
+        ])
+        self.assertTrue(chunks[-1].startswith("event: error"))
+        self.assertIn("rate_limit_error", chunks[-1])
+        # The block that was open is closed before the error
+        self.assertIn("content_block_stop", chunks[-2])
+
+    async def test_finish_reason_without_done_is_a_complete_turn(self):
+        chunks = await self.events([
+            b'data: {"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}\n'])
+        self.assertIn("message_stop", chunks[-1])
 
 
 class TestToolAndEffortFields(unittest.TestCase):
